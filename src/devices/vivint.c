@@ -11,13 +11,17 @@
 
 #include "decoder.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 
 #define VIVINT_MSG_BIT_LEN 80
-#define VIVINT_MAX_SEEDS 8
+#define VIVINT_MAX_SENSORS 8
+#define VIVINT_CACHED_COUNTERS 8
 #define VIVINT_ENTRY_COUNTER 0x17
+#define VIVINT_RABBIT_CIPHER_SIZE 48
 
 /**
 Vivint Door/Window Sensors (345.0 MHz).
@@ -51,13 +55,18 @@ Non-0xd0 subtypes use a packed 12-bit CRC:
 
 0xd0 frames use standard CRC-16 poly 0x8050 over b[0..7].
 
-Per-device keystream (F field, 0x7a frames only):
+Per-device keystream (F field, 0x7a, 0x74, 0x79 frames only):
 
 Each sensor has a 16 bit per-device seed, not transmitted over the air,
 that keys a Rabbit stream cipher core (RFC 4503) advancing every
 transmission (keyed off the 16 bit counter) to produce a keystream byte
 XORed into F; bit 7 of the decrypted byte is the door contact (1 = open).
 The auth nibble in byte 10 of the on-air frame is `(c3 ^ 0x10) & 0xf0`.
+
+Since the seed is only a 16 bit value and the cipher is designed to have
+a high volatility of all the cipher bits per single bit change of the cipher
+key, to determine the seed you need around 5 frames from a sensor with
+different packet counters and about 20 bits of the resulting cipher.
 
 The seed cannot be derived from a single frame or from this decoder alone;
 it must be obtained externally from several frames at known low counters
@@ -73,60 +82,53 @@ See https://github.com/merbanan/rtl_433/issues/1504
 */
 
 /* Rabbit stream cipher core (RFC 4503). Inner state: eight 32-bit state
-   words X0..X7 at 0x232.. and eight 32-bit counter words C0..C7 at 0x252..,
+   words X0..X7, eight 32-bit counter words C0..C7,
    modeled as a flat byte window. Custom to this protocol (not part of
    RFC 4503): a 16-bit seed in place of Rabbit's 128-bit key/IV, and a
    per-packet schedule keyed off the transmission counter. */
+/* Technically, we could just cache the key and the secrets. The states
+   are generated every 12 packets */
 typedef struct {
-    uint8_t m[0x300];
+    uint32_t C[8];
+    uint32_t X[8];
+    uint16_t S[8];
+    uint16_t K[8];
+    uint32_t b;
 } vivint_rabbit_t;
 
-static uint16_t vivint_rabbit_r16(vivint_rabbit_t *g, unsigned a)
+/* Rabbit concat two 16 bit values */
+static uint32_t vivint_rabbit_concat(uint16_t a, uint16_t b)
 {
-    return g->m[a] | ((uint16_t)g->m[a + 1] << 8);
+    return (((uint32_t)a) << 16) | (uint32_t)b;
 }
 
-static void vivint_rabbit_w16(vivint_rabbit_t *g, unsigned a, uint16_t v)
-{
-    g->m[a]     = (uint8_t)v;
-    g->m[a + 1] = (uint8_t)(v >> 8);
-}
-
-static uint32_t vivint_rabbit_r32(vivint_rabbit_t *g, unsigned a)
-{
-    return (uint32_t)vivint_rabbit_r16(g, a) | ((uint32_t)vivint_rabbit_r16(g, a + 2) << 16);
-}
-
-static void vivint_rabbit_w32(vivint_rabbit_t *g, unsigned a, uint32_t v)
-{
-    vivint_rabbit_w16(g, a, (uint16_t)(v & 0xffff));
-    vivint_rabbit_w16(g, a + 2, (uint16_t)(v >> 16));
-}
-
+/* Rabbit rotate a 32bit value to the left */
 static uint32_t vivint_rotl32(uint32_t x, unsigned n)
 {
     return (x << n) | (x >> (32 - n));
 }
 
-/* RFC 4503 SS2.5 counter-update constants A0..A7. */
-static uint32_t const VIVINT_RABBIT_A[8] = {
-        0x4D34D34D, 0xD34D34D3, 0x34D34D34, 0x4D34D34D,
-        0xD34D34D3, 0x34D34D34, 0x4D34D34D, 0xD34D34D3,
-};
+static uint32_t vivint_rabbit_g(uint32_t u, uint32_t v)
+{
+    uint64_t sq = u + v;
+    sq = sq * sq;
+    return ((sq >> 32) & 0x00000000ffffffff) ^ (sq & 0x00000000ffffffff);
+}
 
+/* RFC 4503 SS2.5 counter-update constants A0..A7. */
 /* Expands the 16-bit seed into the 8 words vivint_rabbit_key_setup()
    interleaves into X and C. */
-static void vivint_expand(uint16_t seed, uint16_t out[8])
+static void vivint_expand_key(vivint_rabbit_t *g, uint16_t seed)
 {
-    uint16_t base = seed ^ 0x0008;
-    out[0]        = base;
-    out[1]        = (uint16_t)(base + 0x25);
-    out[2]        = (uint16_t)(base - 0x04);
-    out[3]        = (uint16_t)(base + 0x2c);
-    out[4]        = (uint16_t)(base - 0x09);
-    out[5]        = (uint16_t)(base - 0x1d);
-    out[6]        = base ^ 0x00f9;
-    out[7]        = base ^ 0x0022;
+    // TODO decide if this should be xord with 8 or not
+    g->K[0]        = seed;
+    g->K[1]        = (uint16_t)(seed + 0x25);
+    g->K[2]        = (uint16_t)(seed - 0x04);
+    g->K[3]        = (uint16_t)(seed + 0x2c);
+    g->K[4]        = (uint16_t)(seed - 0x09);
+    g->K[5]        = (uint16_t)(seed - 0x1d);
+    g->K[6]        = seed ^ 0x00f9;
+    g->K[7]        = seed ^ 0x0022;
 }
 
 /* Derives X0..X7 and C0..C7 (RFC 4503 SS2.2) from the 8 seed-expanded words,
@@ -134,34 +136,71 @@ static void vivint_expand(uint16_t seed, uint16_t out[8])
    permutation, re-derived from the counter each call. */
 static void vivint_rabbit_key_setup(vivint_rabbit_t *g)
 {
-    uint16_t counter = vivint_rabbit_r16(g, 0x206);
-    unsigned m       = counter % 7;
-    vivint_rabbit_w16(g, 0x27a + m * 2, (uint16_t)(vivint_rabbit_r16(g, 0x27a + m * 2) + counter + m));
-    vivint_rabbit_w16(g, 0x288, vivint_rabbit_r16(g, 0x288) ^ (uint16_t)m);
+    /* 2.3.  Key Setup Scheme
+    
+     The counter carry bit b is initialized to zero.  The state and
+     counter words are derived from the key K[127..0].
+    
+     The key is divided into subkeys K0 = K[15..0], K1 = K[31..16], ... K7
+     = K[127..112].  The initial state is initialized as follows:
+    
+       for j=0 to 7:
+         if j is even:
+           Xj = K(j+1 mod 8) || Kj
+           Cj = K(j+4 mod 8) || K(j+5 mod 8)
+         else:
+           Xj = K(j+5 mod 8) || K(j+4 mod 8)
+           Cj = Kj || K(j+1 mod 8)
+    */
 
-    uint16_t e[8];
-    for (int i = 0; i < 8; ++i)
-        e[i] = vivint_rabbit_r16(g, 0x27a + 2 * i);
-
-    uint16_t x_words[16];
-    uint16_t c_words[16];
-    for (int r = 0; r < 8; ++r) {
-        if (r % 2 == 0) {
-            x_words[2 * r]     = e[r];
-            x_words[2 * r + 1] = e[(r + 1) % 8];
-            c_words[2 * r]     = e[(r + 5) % 8];
-            c_words[2 * r + 1] = e[(r + 4) % 8];
-        }
-        else {
-            x_words[2 * r]     = e[(r + 4) % 8];
-            x_words[2 * r + 1] = e[(r + 5) % 8];
-            c_words[2 * r]     = e[(r + 1) % 8];
-            c_words[2 * r + 1] = e[r];
-        }
+    g->b = 0;
+    for (int j = 0u; j < 8; j++)
+    {
+      if (j % 2 == 0)
+      {
+        /* EVEN */
+        g->X[j] = vivint_rabbit_concat(g->K[(j + 1) % 8], g->K[j]);
+        g->C[j] = vivint_rabbit_concat(g->K[(j + 4) % 8], g->K[(j + 5) % 8]);
+      } else {
+        /* ODD */
+        g->X[j] = vivint_rabbit_concat(g->K[(j + 5) % 8], g->K[(j + 4) % 8]);
+        g->C[j] = vivint_rabbit_concat(g->K[j], g->K[(j + 1) % 8]);
+      }
     }
-    for (int i = 0; i < 16; ++i) {
-        vivint_rabbit_w16(g, 0x232 + 2 * i, x_words[i]);
-        vivint_rabbit_w16(g, 0x252 + 2 * i, c_words[i]);
+
+}
+
+static void vivint_rabbit_update_counters(vivint_rabbit_t *g)
+{
+     /* 2.5.  Counter System
+
+      Before each execution of the next-state function (Section 2.6), the
+      counter system has to be updated.  This system uses constants
+      A1,...,A7, as follows:
+
+      A0 = 0x4D34D34D         A1 = 0xD34D34D3
+      A2 = 0x34D34D34         A3 = 0x4D34D34D
+      A4 = 0xD34D34D3         A5 = 0x34D34D34
+      A6 = 0x4D34D34D         A7 = 0xD34D34D3
+
+      It also uses the counter carry bit b to update the counter system, as
+      follows:
+
+      for j=0 to 7:
+       temp = Cj + Aj + b
+       b    = temp div WORDSIZE
+       Cj   = temp mod WORDSIZE
+
+      Note that on exiting this loop, the variable b has to be preserved
+      for the next iteration of the system.  */
+
+    const uint32_t A[8] = {0x4D34D34D, 0xD34D34D3, 0x34D34D34, 0x4D34D34D, 0xD34D34D3, 0x34D34D34, 0x4D34D34D, 0xD34D34D3};
+
+    for (int j=0u; j<8; j++) 
+    {
+        uint64_t temp = (uint64_t)(g->C[j]) + (uint64_t)(A[j]) + (uint64_t)(g->b);
+        g->b = temp / 0x100000000;
+        g->C[j] = temp & 0xffffffff;
     }
 }
 
@@ -170,149 +209,139 @@ static void vivint_rabbit_key_setup(vivint_rabbit_t *g)
    products. */
 static void vivint_rabbit_next_state(vivint_rabbit_t *g)
 {
-    unsigned const scratch = 0x294;
+    /* 2.6.  Next-State Function
 
-    for (int r8 = 0; r8 < 8; ++r8) {
-        uint16_t lo = vivint_rabbit_r16(g, 0x252 + r8 * 4);
-        uint16_t hi = vivint_rabbit_r16(g, 0x254 + r8 * 4);
-        vivint_rabbit_w16(g, scratch + r8 * 4, lo);
-        vivint_rabbit_w16(g, scratch + 2 + r8 * 4, hi);
+      The core of the Rabbit algorithm is the next-state function.  It is
+      based on the function g, which transforms two 32-bit inputs into one
+      32-bit output, as follows:
+
+        g(u,v) = LSW(square(u+v)) ^ MSW(square(u+v))
+
+      where square(u+v) = ((u+v mod WORDSIZE) * (u+v mod WORDSIZE)).
+
+      Using this function, the algorithm updates the inner state as
+      follows:
+
+        for j=0 to 7:
+          Gj = g(Xj,Cj)
+
+    */
+
+    uint32_t G[8];
+    for (int j=0u; j<8; j++)
+    {
+      G[j] = vivint_rabbit_g(g->X[j], g->C[j]);
     }
 
-    uint32_t lcg = vivint_rabbit_r32(g, 0x272) + VIVINT_RABBIT_A[0];
-    vivint_rabbit_w32(g, 0x252, vivint_rabbit_r32(g, 0x252) + lcg);
-    for (int r8 = 1; r8 < 8; ++r8) {
-        uint32_t a      = vivint_rabbit_r32(g, 0x252 + r8 * 4);
-        uint32_t b      = vivint_rabbit_r32(g, 0x24e + r8 * 4);
-        uint32_t sub    = vivint_rabbit_r32(g, scratch - 4 + r8 * 4);
-        uint32_t borrow = (b < sub) ? 1 : 0;
-        vivint_rabbit_w32(g, 0x252 + r8 * 4, a + VIVINT_RABBIT_A[r8] + borrow);
-    }
+    // X0 = G0 + (G7 <<< 16) + (G6 <<< 16) mod WORDSIZE
+    g->X[0] = G[0] + vivint_rotl32(G[7], 16) + vivint_rotl32(G[6], 16);
+    // X1 = G1 + (G0 <<<  8) +  G7         mod WORDSIZE
+    g->X[1] = G[1] + vivint_rotl32(G[0], 8) + G[7];
+    // X2 = G2 + (G1 <<< 16) + (G0 <<< 16) mod WORDSIZE
+    g->X[2] = G[2] + vivint_rotl32(G[1], 16) + vivint_rotl32(G[0], 16);
+    // X3 = G3 + (G2 <<<  8) +  G1         mod WORDSIZE
+    g->X[3] = G[3] + vivint_rotl32(G[2], 8) + G[1];
+    // X4 = G4 + (G3 <<< 16) + (G2 <<< 16) mod WORDSIZE
+    g->X[4] = G[4] + vivint_rotl32(G[3], 16) + vivint_rotl32(G[2], 16);
+    // X5 = G5 + (G4 <<<  8) +  G3         mod WORDSIZE
+    g->X[5] = G[5] + vivint_rotl32(G[4], 8) + G[3];
+    // X6 = G6 + (G5 <<< 16) + (G4 <<< 16) mod WORDSIZE
+    g->X[6] = G[6] + vivint_rotl32(G[5], 16) + vivint_rotl32(G[4], 16);
+    // X7 = G7 + (G6 <<<  8) +  G5         mod WORDSIZE
+    g->X[7] = G[7] + vivint_rotl32(G[6], 8) + G[5];
 
-    uint32_t borrow = (vivint_rabbit_r32(g, 0x26e) < vivint_rabbit_r32(g, 0x2b0)) ? 1 : 0;
-    vivint_rabbit_w16(g, 0x272, (uint16_t)borrow);
-    vivint_rabbit_w16(g, 0x274, 0);
-
-    for (int r8 = 0; r8 < 8; ++r8) {
-        uint32_t x   = vivint_rabbit_r32(g, 0x232 + r8 * 4) + vivint_rabbit_r32(g, 0x252 + r8 * 4);
-        uint32_t lo  = x & 0xffff;
-        uint32_t hi  = x >> 16;
-        uint32_t xsq = x * x;
-        uint32_t acc = (lo * lo >> 16) >> 1;
-        acc          = acc + lo * hi;
-        acc >>= 15;
-        acc = acc + hi * hi;
-        acc ^= xsq;
-        vivint_rabbit_w32(g, scratch + r8 * 4, acc);
-    }
-
-    int r11        = 7;
-    int r10        = 6;
-    int r8s[4]     = {0, 2, 4, 6};
-    for (int i = 0; i < 4; ++i) {
-        int r8      = r8s[i];
-        uint32_t t1 = vivint_rotl32(vivint_rabbit_r32(g, scratch + r11 * 4), 16);
-        uint32_t t2 = vivint_rotl32(vivint_rabbit_r32(g, scratch + r10 * 4), 16);
-        vivint_rabbit_w32(g, 0x232 + r8 * 4, t1 + vivint_rabbit_r32(g, scratch + r8 * 4) + t2);
-        r11 = (r11 + 1) % 8;
-        r10 = (r10 + 1) % 8;
-        uint32_t t3 = vivint_rotl32(vivint_rabbit_r32(g, scratch + r11 * 4), 8);
-        vivint_rabbit_w32(g, 0x236 + r8 * 4, t3 + vivint_rabbit_r32(g, scratch + 4 + r8 * 4) + vivint_rabbit_r32(g, scratch + r10 * 4));
-        r11 = (r11 + 1) % 8;
-        r10 = (r10 + 1) % 8;
-    }
 }
 
-/* RFC 4503 SS2.3 post-key-setup counter reinitialization: Cj ^= X(j+4 mod 8). */
-static void vivint_rabbit_counter_remix(vivint_rabbit_t *g)
+static void vivint_rabbit_reinitialize_counters(vivint_rabbit_t *g)
 {
-    for (int r10 = 0; r10 < 8; ++r10) {
-        int r11 = r10 * 4;
-        int r14 = ((r10 + 4) % 8) * 4;
-        vivint_rabbit_w16(g, 0x252 + r11, vivint_rabbit_r16(g, 0x252 + r11) ^ vivint_rabbit_r16(g, 0x232 + r14));
-        vivint_rabbit_w16(g, 0x254 + r11, vivint_rabbit_r16(g, 0x254 + r11) ^ vivint_rabbit_r16(g, 0x234 + r14));
+    for (int j = 0u; j < 8; j++)
+    {
+      g->C[j] ^= g->X[(j+4) % 8];
     }
 }
+
 
 /* Reduced extraction: RFC 4503 SS2.7 derives a full 128 bit block; this
    protocol only needs the status keystream byte (c1) and the auth byte
    (c3), selecting a different X-word combination per counter mod 4. */
 static void vivint_rabbit_extract(vivint_rabbit_t *g)
 {
-    unsigned k = vivint_rabbit_r16(g, 0x206) & 3;
-    uint16_t r14;
-    uint16_t r12;
-    uint16_t r13;
-    switch (k) {
-    case 0:
-        r14 = vivint_rabbit_r16(g, 0x23e);
-        r12 = vivint_rabbit_r16(g, 0x248) ^ vivint_rabbit_r16(g, 0x232);
-        r13 = vivint_rabbit_r16(g, 0x234);
-        break;
-    case 1:
-        r14 = vivint_rabbit_r16(g, 0x246);
-        r12 = vivint_rabbit_r16(g, 0x250) ^ vivint_rabbit_r16(g, 0x23a);
-        r13 = vivint_rabbit_r16(g, 0x23c);
-        break;
-    case 2:
-        r14 = vivint_rabbit_r16(g, 0x24e);
-        r12 = vivint_rabbit_r16(g, 0x238) ^ vivint_rabbit_r16(g, 0x242);
-        r13 = vivint_rabbit_r16(g, 0x244);
-        break;
-    default:
-        r14 = vivint_rabbit_r16(g, 0x236);
-        r12 = vivint_rabbit_r16(g, 0x240) ^ vivint_rabbit_r16(g, 0x24a);
-        r13 = vivint_rabbit_r16(g, 0x24c);
-        break;
-    }
-    r13 ^= r14;
-    g->m[0x2c1] = (uint8_t)r12;
-    g->m[0x2c2] = (uint8_t)(r12 >> 8);
-    g->m[0x2c3] = (uint8_t)r13;
-    g->m[0x2c4] = (uint8_t)(r13 >> 8);
+    //  2.7.  Extraction Scheme
+
+    //  After the key and IV setup are concluded, the algorithm is iterated
+    //  in order to produce one 128-bit output block, S, per round.  Each
+    //  round consists of executing steps 2.5 and 2.6 and then extracting an
+    //  output S[127..0] as follows:
+
+    //    S[15..0]    = X0[15..0]  ^ X5[31..16]
+    g->S[0] = (g->X[0] & 0xffff) ^ ((g->X[5] >> 16) & 0xffff);
+    //    S[31..16]   = X0[31..16] ^ X3[15..0]
+    g->S[1] = ((g->X[0] >> 16) & 0xffff) ^ (g->X[3] & 0xffff);
+    //    S[47..32]   = X2[15..0]  ^ X7[31..16]
+    g->S[2] = (g->X[2] & 0xffff) ^ ((g->X[7] >> 16) & 0xffff);
+    //    S[63..48]   = X2[31..16] ^ X5[15..0]
+    g->S[3] = ((g->X[2] >> 16) & 0xffff) ^ (g->X[5] & 0xffff);
+    //    S[79..64]   = X4[15..0]  ^ X1[31..16]
+    g->S[4] = (g->X[4] & 0xffff) ^ ((g->X[1] >> 16) & 0xffff);
+    //    S[95..80]   = X4[31..16] ^ X7[15..0]
+    g->S[5] = ((g->X[4] >> 16) & 0xffff) ^ (g->X[7] & 0xffff);
+    //    S[111..96]  = X6[15..0]  ^ X3[31..16]
+    g->S[6] = (g->X[6] & 0xffff) ^ ((g->X[3] >> 16) & 0xffff);
+    //    S[127..112] = X6[31..16] ^ X1[15..0]
+    g->S[7] = ((g->X[6] >> 16) & 0xffff) ^ (g->X[1] & 0xffff);
+
 }
 
-/* Full reseed: key setup, 4 rounds of next-state, counter remix, one more
-   next-state, then extract. Run every 12th counter tick. */
-static void vivint_rabbit_reseed(vivint_rabbit_t *g)
+// Generate the 48 bytes of cipher given a specific key
+// out should be a uint8_t[48]
+static void vivint_rabbit_gen_cipher(vivint_rabbit_t *g, uint8_t *out)
 {
-    vivint_rabbit_w16(g, 0x272, 0);
-    vivint_rabbit_w16(g, 0x274, 0);
+  
     vivint_rabbit_key_setup(g);
-    for (int i = 0; i < 4; ++i)
+  
+    // Iterate 4 times before extracting secrets
+    for (int i=0; i < 4; i++)
+    {
+        vivint_rabbit_update_counters(g);
         vivint_rabbit_next_state(g);
-    vivint_rabbit_counter_remix(g);
-    vivint_rabbit_next_state(g);
-    vivint_rabbit_extract(g);
-}
-
-static void vivint_rabbit_begin(vivint_rabbit_t *g, uint16_t seed)
-{
-    uint16_t init[8];
-    memset(g->m, 0, sizeof(g->m));
-    vivint_expand(seed, init);
-    for (int i = 0; i < 8; ++i)
-        vivint_rabbit_w16(g, 0x27a + 2 * i, init[i]);
-}
-
-/* Advances one transmit; returns the new counter and status-key (c1) byte. */
-static uint16_t vivint_rabbit_tick(vivint_rabbit_t *g, uint16_t counter, uint8_t *c1_out)
-{
-    counter = (counter == 0xfff7) ? 0 : (uint16_t)(counter + 1);
-    vivint_rabbit_w16(g, 0x206, counter);
-    if (counter % 12 == 0) {
-        vivint_rabbit_reseed(g);
     }
-    else if (counter % 4 == 0) {
+    // Necessary step before extracting the secrets
+    vivint_rabbit_reinitialize_counters(g);
+    
+    // Now we pull out all 48 bytes of data for the cipher
+    // auto out = ret.begin();
+    for (int i=0; i<3; i++)
+    {
+
+        vivint_rabbit_update_counters(g);
         vivint_rabbit_next_state(g);
         vivint_rabbit_extract(g);
+
+        for (int j = 0; j < 8; j++)
+        {
+            *out = g->S[j] & 0x00ff;
+            out++;
+            *out = (g->S[j] >> 8) & 0x00ff;
+            out++;
+        }
     }
-    else {
-        vivint_rabbit_extract(g);
-    }
-    *c1_out = g->m[0x2c1];
-    return counter;
 }
+
+// Customization to the rabbit cipher that modifies the 128bit key based on the packet counter
+static void vivint_gen_rabbit_key(vivint_rabbit_t *g, uint16_t seed, uint16_t counter)
+{
+    uint16_t i = 24;
+    do
+    {
+        if (i > 0xfff7) { i = 0; }
+        if (i == 24) { vivint_expand_key(g, seed); }
+        int mod = i % 7;
+        g->K[mod] =  i + mod + g->K[mod];
+        g->K[7] = g->K[7] ^ mod;
+        i+=12;
+    } while(i <= counter);
+}
+
 
 /* Per-device decode state: advanced incrementally as packets with
    increasing counters arrive, re-synced from the entry counter on a
@@ -320,59 +349,26 @@ static uint16_t vivint_rabbit_tick(vivint_rabbit_t *g, uint16_t counter, uint8_t
 typedef struct {
     uint32_t id;
     uint16_t seed;
-    vivint_rabbit_t gen;
-    uint16_t counter;
-    uint8_t last_c1;
-    int has_last_c1;
-} vivint_seed_t;
+    uint16_t last_counter;
+    uint8_t cipher[VIVINT_RABBIT_CIPHER_SIZE];
+    int counter_idx;
+    uint16_t counters[VIVINT_CACHED_COUNTERS];
+    uint8_t cipher_cache[VIVINT_CACHED_COUNTERS];
+} vivint_sensor_t;
 
 typedef struct {
     unsigned count;
-    vivint_seed_t seeds[VIVINT_MAX_SEEDS];
+    vivint_sensor_t sensors[VIVINT_MAX_SENSORS];
 } vivint_ctx_t;
 
-static void vivint_seed_reset(vivint_seed_t *s)
-{
-    vivint_rabbit_begin(&s->gen, s->seed);
-    s->counter     = VIVINT_ENTRY_COUNTER;
-    s->has_last_c1 = 0;
-}
-
-/* Returns the status-key byte at counter `target`, or -1 if unreachable
-   (more than one counter cycle away, or target is the entry counter
-   itself, which is never an observed on-air value). */
-static int vivint_seed_c1_at(vivint_seed_t *s, uint16_t target)
-{
-    if (s->has_last_c1 && target == s->counter) {
-        return s->last_c1;
-    }
-    if (target < s->counter) {
-        vivint_seed_reset(s);
-    }
-    unsigned steps = 0;
-    while (s->counter != target) {
-        uint8_t c1;
-        s->counter     = vivint_rabbit_tick(&s->gen, s->counter, &c1);
-        s->last_c1     = c1;
-        s->has_last_c1 = 1;
-        if (s->counter == target) {
-            return c1;
-        }
-        if (++steps > 0x10000) {
-            return -1;
-        }
-    }
-    return -1;
-}
-
-static vivint_seed_t *vivint_ctx_find(vivint_ctx_t *ctx, uint32_t id)
+static vivint_sensor_t *vivint_ctx_find(vivint_ctx_t *ctx, uint32_t id)
 {
     if (!ctx) {
         return NULL;
     }
     for (unsigned i = 0; i < ctx->count; ++i) {
-        if (ctx->seeds[i].id == id) {
-            return &ctx->seeds[i];
+        if (ctx->sensors[i].id == id) {
+            return &ctx->sensors[i];
         }
     }
     return NULL;
@@ -416,18 +412,93 @@ static r_device *vivint_create(char const *args)
         unsigned p1;
         unsigned p2;
         unsigned seed;
-        if (ctx->count < VIVINT_MAX_SEEDS
+        if (ctx->count < VIVINT_MAX_SENSORS
                 && sscanf(tok, "%u-%u=%x", &p1, &p2, &seed) == 3) {
-            vivint_seed_t *s = &ctx->seeds[ctx->count++];
+            vivint_sensor_t *s = &ctx->sensors[ctx->count++];
             s->id            = ((p1 & 0xfff) << 20) | (p2 & 0xfffff);
             s->seed          = (uint16_t)seed;
-            vivint_seed_reset(s);
         }
         tok = vivint_strtok(NULL, ",", &saveptr);
     }
 
     free(work);
     return dev;
+}
+
+static void vivint_rabbit_advance_cipher(vivint_sensor_t *s, uint16_t counter)
+{
+    // Need to check to see if we need to regenerate our cipher output
+    int diff = counter - s->last_counter;
+    if ((s->last_counter == 0xffff) ||
+        (counter % 12 == 0) || (diff > 12) || (diff < -12) ||
+        (counter % 12 < s->last_counter % 12))
+    {
+      // We need to regenerate
+      // Could make static to take it off of the stack
+      vivint_rabbit_t rabbit;
+      vivint_gen_rabbit_key(&rabbit, s->seed, counter);
+      vivint_rabbit_gen_cipher(&rabbit, s->cipher);
+    }
+    s->last_counter = counter;
+}
+
+/* The other 4 bits of bytes 8 and 9 in the data contain 4 bits of the raw cipher data xor'd with 0x10 */
+static int vivint_validate_rabbit_nibble(vivint_sensor_t *s, uint8_t check, uint16_t counter)
+{
+    int mod = counter % 12;
+    uint8_t mac_byte = s->cipher[mod*4 + 2] & 0xf0;
+
+    return mac_byte == (check ^ 0x10);
+}
+
+/* Returns the decrypted message data */
+static int vivint_decrypt_flags(vivint_sensor_t *s, int flags, uint16_t counter)
+{
+    int mod = counter % 12;
+
+    int decrypt_byte = s->cipher[mod*4];
+
+    // The last 2 bits are always 0 in encrypted messages
+    return (flags ^ decrypt_byte) & 0xfc;
+}
+
+/* Iterates through cached data from a sensor to determine the seed */
+static int vivint_determine_seed(vivint_sensor_t *s)
+{
+    int num_matches = 0;
+    uint16_t matched_seed = 0xffff;
+    for (uint16_t seed = 1; seed < 0xffff; seed++)
+    {
+        s->last_counter = 0xffff;
+        for (int i = 0; i < 6; i++)
+        {
+            s->seed = seed;
+            vivint_rabbit_advance_cipher(s, s->counters[i]);
+            if (!vivint_validate_rabbit_nibble(s, s->cipher_cache[i], s->counters[i]))
+            {
+                // if (i > 0) {
+                  // printf("Not this seed after: %d\n", i);
+                // }
+                break;
+            }
+            if (i == 5)
+            {
+                matched_seed = seed;
+                num_matches++;
+            }
+        }
+    }
+
+    if (num_matches == 1)
+    {
+        printf("Determined seed: %x\n", matched_seed);
+        s->seed = matched_seed;
+        return 1;
+    } else {
+        s->seed = 0xffff;
+        return 0;
+    }
+
 }
 
 static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
@@ -459,6 +530,7 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     int flags       = b[3];
     unsigned id     = ((unsigned)b[4] << 24) | ((unsigned)b[5] << 16) | ((unsigned)b[6] << 8) | b[7];
     int crc         = (b[8] << 8) | b[9];
+    int cipher_nibble = b[8] & 0xf0;
 
     if (id == 0 || id == 0xffffffff) {
         decoder_logf(decoder, 2, __func__, "Id sanity check failed (%08x)", id);
@@ -466,6 +538,7 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     }
 
     int crc_valid = 0;
+    // TODO add the other packet types that don't use the 12bit crc
     if (event_type == 0xd0) {
         if (crc == crc16(b, 8, 0x8050, 0)) crc_valid = 1;
     }
@@ -487,36 +560,82 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     char id_str[13];
     snprintf(id_str, sizeof(id_str), "%04u-%07u", (id >> 20) & 0xfff, id & 0xfffff);
 
-    int has_contact  = 0;
+    int has_valid_flags  = 0;
 
-    int contact_bit     = 0;    // External contact open/closed state
+    int loop1_bit       = 0;    // Loop 1, PIR motion, external contact for DW11, and reed for DW21R
     int tamper_bit      = 0;    // Case open tamper
-    int reed_bit        = 0;    // Primary use case for DW11
-    int alarm_bit       = 0;    // Unknown meaning for DW11, copied from honeywell.c
+    int loop2_bit       = 0;    // Loop 2, or reed for DW11
+    int alarm_bit       = 0;    // Unused
     int battery_low_bit = 0;    // Tested
-    int heartbeat_bit   = 0;    // Unknown meaning for DW11, copied from honeywell.c
+    int heartbeat_bit   = 0;    // Bit that toggles at a timed interval based on sum of 797
 
-    if (event_type == 0x7a) {
-        vivint_seed_t *s = vivint_ctx_find((vivint_ctx_t *)decoder_user_data(decoder), id);
-        if (s) {
-            int c1 = vivint_seed_c1_at(s, (uint16_t)counter);
-            if (c1 >= 0) {
-                has_contact  = 1;
-                /* Extract DW11 event bits (CTRABHUU layout):
-                   C=contact(7), T=tamper(6), R=reed(5), A=alarm(4),
-                   B=battery_low(3), H=heartbeat(2), U,U=unused(1,0) */
-                contact_bit     = (flags ^ c1) & 0x80 ? 1 : 0;
-                tamper_bit      = (flags ^ c1) & 0x40 ? 1 : 0;
-                reed_bit        = (flags ^ c1) & 0x20 ? 1 : 0;
-                alarm_bit       = (flags ^ c1) & 0x10 ? 1 : 0;
-                battery_low_bit = (flags ^ c1) & 0x08 ? 1 : 0;
-                heartbeat_bit   = (flags ^ c1) & 0x04 ? 1 : 0;
+    // TODO: Should work on other packets as well.
+    if (event_type == 0x7a || event_type == 0x74 || event_type == 0x79) {
+
+        // TODO Should check bit 1 of the event data to see if this packet is encrypted
+        vivint_sensor_t *s = vivint_ctx_find((vivint_ctx_t *)decoder_user_data(decoder), id);
+
+        // If we don't know about this TXID, let's add it to our list if we have room and try to crack the seed
+        if (!s)
+        {
+            vivint_ctx_t *ctx = (vivint_ctx_t *)decoder_user_data(decoder);
+            if (ctx->count < VIVINT_MAX_SENSORS) {
+                s = &ctx->sensors[ctx->count++];
+                s->id            = id;
+                s->seed          = 0xffff;
+                s->last_counter  = 0xffff;
+                s->counter_idx   = 0;
             }
+        }
+        if (s) {
+            // Let's see if we can determine the seed
+            if (s->seed == 0xffff || s->seed == 0x0000)
+            {
+                // Store the data we need to determine the seed
+                // Prevent duplicates
+                if (counter != s->last_counter)
+                {
+                    int idx = s->counter_idx % VIVINT_RABBIT_CIPHER_SIZE;
+                    s->cipher_cache[idx] = cipher_nibble;
+                    s->counters[idx] = counter;
+                    s->counter_idx++;
+                    // Check if we have enough data to determine the seed
+                    if (s->counter_idx >= 6)
+                    {
+                        printf("Attempting to crack seed\n");
+                        vivint_determine_seed(s);
+                    }
+                }
+                s->last_counter = counter;
+            } else {
+                // This is where we try to decode the message
+                // We also need to check the high nibble of byte 8 to check if 
+                // the cipher is correct
+                vivint_rabbit_advance_cipher(s, counter);
+                if (vivint_validate_rabbit_nibble(s, cipher_nibble, counter))
+                {
+                    has_valid_flags  = 1;
+                    flags = vivint_decrypt_flags(s, flags, counter);
+                    /* Extract DW11 event bits (CTRABHEZ layout):
+                       C=contact(7), T=tamper(6), R=reed(5), A=alarm(4),
+                       B=battery_low(3), H=heartbeat(2), E=Encrypted(1),
+                       Z=zero(0) */
+                    loop1_bit       = flags & 0x80 ? 1 : 0;
+                    tamper_bit      = flags & 0x40 ? 1 : 0;
+                    loop2_bit       = flags & 0x20 ? 1 : 0;
+                    alarm_bit       = flags & 0x10 ? 1 : 0;
+                    battery_low_bit = flags & 0x08 ? 1 : 0;
+                    heartbeat_bit   = flags & 0x04 ? 1 : 0;
+                } else {
+                    decoder_logf(decoder, 2, __func__, "Invalid Rabbit cipher check nibble");
+                }
+            }
+        } else {
         }
     }
 
     char payload[21];
-    if (!has_contact) {
+    if (!has_valid_flags) {
         for (int i = 0; i < 10; ++i)
             snprintf(&payload[i * 2], 3, "%02x", b[i]);
     }
@@ -528,14 +647,14 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             "counter",      "",              DATA_FORMAT, "%04x", DATA_INT, counter,
             "flags",        "",              DATA_FORMAT, "%02x", DATA_INT, flags,
             "event_type",   "",              DATA_FORMAT, "%02x", DATA_INT, event_type,
-            "state",        "",              DATA_COND, has_contact,  DATA_STRING, contact_bit ? "open" : "closed",
-            "contact_open", "",              DATA_COND, has_contact,  DATA_INT,     contact_bit,
-            "tamper",       "",              DATA_COND, has_contact,  DATA_INT,     tamper_bit,
-            "reed",         "",              DATA_COND, has_contact,  DATA_INT,     reed_bit,
-            "alarm",        "",              DATA_COND, has_contact,  DATA_INT,     alarm_bit,
-            "battery_low",  "Battery",       DATA_COND, has_contact,  DATA_INT,     battery_low_bit,
-            "heartbeat",    "",              DATA_COND, has_contact,  DATA_INT,     heartbeat_bit,
-            "data",         "",              DATA_COND, !has_contact, DATA_STRING, payload,
+            "state",        "",              DATA_COND, has_valid_flags,  DATA_STRING, loop1_bit ? "open" : "closed",
+            "loop1",        "",              DATA_COND, has_valid_flags,  DATA_INT,     loop1_bit,
+            "tamper",       "",              DATA_COND, has_valid_flags,  DATA_INT,     tamper_bit,
+            "loop2",        "",              DATA_COND, has_valid_flags,  DATA_INT,     loop2_bit,
+            "alarm",        "",              DATA_COND, has_valid_flags,  DATA_INT,     alarm_bit,
+            "battery_low",  "Battery",       DATA_COND, has_valid_flags,  DATA_INT,     battery_low_bit,
+            "heartbeat",    "",              DATA_COND, has_valid_flags,  DATA_INT,     heartbeat_bit,
+            "data",         "",              DATA_COND, !has_valid_flags, DATA_STRING, payload,
             "mic",          "Integrity",     DATA_STRING, "CRC",
             NULL);
     /* clang-format on */
@@ -551,9 +670,9 @@ static char const *const output_fields[] = {
         "flags",
         "event_type",
         "state",
-        "contact_open",
+        "loop1",
         "tamper",
-        "reed",
+        "loop2",
         "alarm",
         "battery_low",
         "heartbeat",

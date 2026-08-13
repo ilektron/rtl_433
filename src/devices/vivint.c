@@ -11,6 +11,7 @@
 
 #include "decoder.h"
 
+#include <openssl/x509.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,9 @@
 #define VIVINT_CACHED_COUNTERS 8
 #define VIVINT_ENTRY_COUNTER 0x17
 #define VIVINT_RABBIT_CIPHER_SIZE 48
+#define VIVINT_EVENT_DW 0x7a
+#define VIVINT_EVENT_PIR 0x74
+#define VIVINT_EVENT_GB 0x79
 
 /**
 Vivint Door/Window Sensors (345.0 MHz).
@@ -493,6 +497,9 @@ static int vivint_determine_seed(vivint_sensor_t *s)
     {
         printf("Determined seed: %x\n", matched_seed);
         s->seed = matched_seed;
+        // Reset the last counter so it regenerates the cipher with the new key
+        s->last_counter = 0xffff;
+        vivint_rabbit_advance_cipher(s, s->counters[(s->counter_idx - 1) % VIVINT_CACHED_COUNTERS]);
         return 1;
     } else {
         s->seed = 0xffff;
@@ -607,7 +614,10 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
                     }
                 }
                 s->last_counter = counter;
-            } else {
+            }
+
+            if (s->seed != 0xffff && s->seed != 0x0000) 
+            {
                 // This is where we try to decode the message
                 // We also need to check the high nibble of byte 8 to check if 
                 // the cipher is correct
@@ -640,9 +650,27 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             snprintf(&payload[i * 2], 3, "%02x", b[i]);
     }
 
+    // TODO move this somewhere more appropriate
+    const char* model = "Vivint-Security";
+    switch (event_type)
+    {
+        case VIVINT_EVENT_DW:
+            model = "Vivint-Security DW11 or DW21R";
+            break;
+        case VIVINT_EVENT_PIR:
+            model = "Vivint-Security PIR2";
+            break;
+        case VIVINT_EVENT_GB:
+            model = "Vivint-Security GB";
+            break;
+        default:
+            break;
+    }
+
+    // TODO change the model to match the device type
     /* clang-format off */
     data_t *data = data_make(
-            "model",        "",              DATA_STRING, "Vivint-Security",
+            "model",        "",              DATA_STRING, model,
             "id",           "",              DATA_STRING, id_str,
             "counter",      "",              DATA_FORMAT, "%04x", DATA_INT, counter,
             "flags",        "",              DATA_FORMAT, "%02x", DATA_INT, flags,

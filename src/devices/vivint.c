@@ -11,7 +11,6 @@
 
 #include "decoder.h"
 
-#include <openssl/x509.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

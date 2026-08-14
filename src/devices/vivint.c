@@ -26,6 +26,12 @@
 #define VIVINT_EVENT_PIR 0x74
 #define VIVINT_EVENT_GB 0x79
 
+// Include seed and seed-discovery diagnostics in decoder output by default.
+// Define OUTPUT_VIVINT_DECODE=0 to omit these fields from emitted data.
+#ifndef OUTPUT_VIVINT_DECODE
+#define OUTPUT_VIVINT_DECODE 1
+#endif
+
 /**
 Vivint security sensors (345.0 MHz).
 
@@ -75,16 +81,37 @@ the result is not unique, later frames replace older samples and the search is
 retried. Seed discovery state is reported in `decode_status`,
 `seed_data_count`, `seed_data_required`, and `seed_candidate_count`.
 
-A known seed can instead be supplied at registration time to decrypt F
-immediately:
+A known seed can be supplied to decrypt F immediately. rtl_433 accepts a
+comma-separated TXID-to-seed list as a runtime decoder argument:
 
     rtl_433 -R 342:0019-0507610=05c9,0019-0507743=dda9
 
-Once a seed is configured or discovered, it is reported in `seed`. When the
-seed and authentication nibble are valid, the decrypted `state`, `loop1`,
-`tamper`, `loop2`, `alarm`, `battery_low`, and `heartbeat` fields are emitted.
-Until then, those fields are omitted and the raw payload is reported in
-`data`.
+rtl_433_ESP accepts the same list through the compile-time VIVINT_SEEDS
+definition:
+
+    '-DVIVINT_SEEDS="0019-0507610=05c9,0019-0507743=dda9"'
+
+The runtime argument takes precedence when both are present. Without either,
+automatic seed discovery remains enabled.
+
+When OUTPUT_VIVINT_DECODE is enabled (the default), a configured or discovered
+seed is reported in `seed` as a four-character hexadecimal string along with
+the seed-discovery status fields; set it to 0 to omit them. Valid seeds and
+authentication nibbles emit the decrypted `state`, `loop1`, `tamper`, `loop2`,
+`alarm`, `battery_low`, and `heartbeat` fields. Otherwise, `data` contains the
+raw payload.
+
+For example, create `vivint-defines.cmake` in the source directory to supply a
+seed and disable its diagnostic fields:
+
+    set(CMAKE_C_FLAGS
+        "${CMAKE_C_FLAGS} -DOUTPUT_VIVINT_DECODE=0 -DVIVINT_SEEDS=\\\"0016-0357170=c283\\\""
+        CACHE STRING "Custom Vivint compiler definitions" FORCE)
+
+Then configure and build normally:
+
+    cmake -S . -B build -G Ninja -C vivint-defines.cmake
+    cmake --build build -j4
 
 See https://github.com/merbanan/rtl_433/issues/1504
 */
@@ -394,8 +421,9 @@ static char *vivint_strtok(char *str, char const *delim, char **saveptr)
 #endif
 }
 
-/* Parses a comma separated "NNNN-NNNNNNN=hexseed" list (the same TXID
-   format this decoder prints), e.g. -R N:0019-0507610=05c9,0019-0507743=dda9 */
+/* Parses a comma-separated "NNNN-NNNNNNN=hexseed" list (the same TXID
+   format this decoder prints). The list can come from rtl_433's standard
+   runtime decoder argument or rtl_433_ESP's VIVINT_SEEDS definition. */
 static r_device *vivint_create(char const *args)
 {
     r_device *dev = decoder_create(&vivint, sizeof(vivint_ctx_t));
@@ -405,6 +433,15 @@ static r_device *vivint_create(char const *args)
 
     vivint_ctx_t *ctx = (vivint_ctx_t *)decoder_user_data(dev);
     ctx->count        = 0;
+
+#ifdef VIVINT_SEEDS
+    // Preserve rtl_433's runtime decoder argument as the preferred method.
+    // ESP32 has no command-line registration, so fall back to the compile-time
+    // seed list only when the caller supplied no runtime argument.
+    if (!args || !*args) {
+        args = VIVINT_SEEDS;
+    }
+#endif
 
     if (!args || !*args) {
         return dev;
@@ -692,17 +729,28 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             break;
     }
 
+#if OUTPUT_VIVINT_DECODE
+    char seed_str[5];
+    snprintf(seed_str, sizeof(seed_str), "%04x", seed);
+#else
+    // These values still drive decoder state above, but are not emitted.
+    (void)seed_data_count;
+    (void)decode_status;
+#endif
+
     // TODO change the model to match the device type
     /* clang-format off */
     data_t *data = data_make(
             "model",        "",              DATA_STRING, model,
             "id",           "",              DATA_STRING, id_str,
             "counter",      "",              DATA_FORMAT, "%04x", DATA_INT, counter,
-            "seed",         "",              DATA_COND, seed != 0xffff && seed != 0x0000, DATA_FORMAT, "%04x", DATA_INT, seed,
+#if OUTPUT_VIVINT_DECODE
+            "seed",         "",              DATA_COND, seed != 0xffff && seed != 0x0000, DATA_STRING, seed_str,
             "decode_status", "Decode status", DATA_STRING, decode_status,
             "seed_data_count", "Seed samples collected", DATA_COND, seed == 0xffff || seed == 0x0000, DATA_INT, seed_data_count,
             "seed_data_required", "Seed samples required", DATA_COND, seed == 0xffff || seed == 0x0000, DATA_INT, 6,
             "seed_candidate_count", "Seed candidates", DATA_COND, (seed == 0xffff || seed == 0x0000) && seed_matches >= 0, DATA_INT, seed_matches,
+#endif
             "flags",        "",              DATA_FORMAT, "%02x", DATA_INT, flags,
             "event_type",   "",              DATA_FORMAT, "%02x", DATA_INT, event_type,
             "state",        "",              DATA_COND, has_valid_flags,  DATA_STRING, loop1_bit ? "open" : "closed",
@@ -725,11 +773,13 @@ static char const *const output_fields[] = {
         "model",
         "id",
         "counter",
+#if OUTPUT_VIVINT_DECODE
         "seed",
         "decode_status",
         "seed_data_count",
         "seed_data_required",
         "seed_candidate_count",
+#endif
         "flags",
         "event_type",
         "state",

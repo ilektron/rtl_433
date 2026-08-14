@@ -1,5 +1,5 @@
 /** @file
-    Vivint Door/Window Sensors (345 MHz).
+    Vivint security sensors (345 MHz).
 
     Copyright (C) 2026 Benjamin Larsson <banan@ludd.ltu.se>
 
@@ -28,9 +28,10 @@
 #define VIVINT_EVENT_GB 0x79
 
 /**
-Vivint Door/Window Sensors (345.0 MHz).
+Vivint security sensors (345.0 MHz).
 
-Tested with the Vivint V-DW21R-345 door/window sensor and Vivint V-DW11-345 Door Sensor.
+Tested with the Vivint V-DW21R-345 and V-DW11-345 door/window sensors.
+The decoder also identifies PIR2 motion and GB2 glass-break frame types.
 
 OOK Manchester (zerobit), 0xFFFE preamble, 96 bit (12 byte) packet. Decoded
 payload (80 data bits, 10 bytes) after the preamble:
@@ -65,22 +66,26 @@ Each sensor has a 16 bit per-device seed, not transmitted over the air,
 that keys a Rabbit stream cipher core (RFC 4503) advancing every
 transmission (keyed off the 16 bit counter) to produce a keystream byte
 XORed into F; bit 7 of the decrypted byte is the door contact (1 = open).
-The auth nibble in byte 10 of the on-air frame is `(c3 ^ 0x10) & 0xf0`.
+The high nibble of the first CRC byte carries an authentication value of
+`(c3 ^ 0x10) & 0xf0`.
 
-Since the seed is only a 16 bit value and the cipher is designed to have
-a high volatility of all the cipher bits per single bit change of the cipher
-key, to determine the seed you need around 5 frames from a sensor with
-different packet counters and about 20 bits of the resulting cipher.
+The decoder can discover the 16 bit seed by collecting frames with distinct
+packet counters. Once six samples are available, it searches the seed space
+using the authentication nibble from the six most recent cached samples. If
+the result is not unique, later frames replace older samples and the search is
+retried. Seed discovery state is reported in `decode_status`,
+`seed_data_count`, `seed_data_required`, and `seed_candidate_count`.
 
-The seed cannot be derived from a single frame or from this decoder alone;
-it must be obtained externally from several frames at known low counters
-(ideally right after a power-cycle). Once known, supply it at registration
-time to decrypt F:
+A known seed can instead be supplied at registration time to decrypt F
+immediately:
 
     rtl_433 -R 342:0019-0507610=05c9,0019-0507743=dda9
 
-Without a matching seed, `state`/`contact_open` are omitted and the raw
-payload is reported in `data` instead.
+Once a seed is configured or discovered, it is reported in `seed`. When the
+seed and authentication nibble are valid, the decrypted `state`, `loop1`,
+`tamper`, `loop2`, `alarm`, `battery_low`, and `heartbeat` fields are emitted.
+Until then, those fields are omitted and the raw payload is reported in
+`data`.
 
 See https://github.com/merbanan/rtl_433/issues/1504
 */
@@ -124,15 +129,15 @@ static uint32_t vivint_rabbit_g(uint32_t u, uint32_t v)
    interleaves into X and C. */
 static void vivint_expand_key(vivint_rabbit_t *g, uint16_t seed)
 {
-    // TODO decide if this should be xord with 8 or not
-    g->K[0]        = seed;
-    g->K[1]        = (uint16_t)(seed + 0x25);
-    g->K[2]        = (uint16_t)(seed - 0x04);
-    g->K[3]        = (uint16_t)(seed + 0x2c);
-    g->K[4]        = (uint16_t)(seed - 0x09);
-    g->K[5]        = (uint16_t)(seed - 0x1d);
-    g->K[6]        = seed ^ 0x00f9;
-    g->K[7]        = seed ^ 0x0022;
+    uint16_t base = seed ^ 0x0008;
+    g->K[0]        = base;
+    g->K[1]        = (uint16_t)(base + 0x25);
+    g->K[2]        = (uint16_t)(base - 0x04);
+    g->K[3]        = (uint16_t)(base + 0x2c);
+    g->K[4]        = (uint16_t)(base - 0x09);
+    g->K[5]        = (uint16_t)(base - 0x1d);
+    g->K[6]        = base ^ 0x00f9;
+    g->K[7]        = base ^ 0x0022;
 }
 
 /* Derives X0..X7 and C0..C7 (RFC 4503 SS2.2) from the 8 seed-expanded words,
@@ -141,13 +146,13 @@ static void vivint_expand_key(vivint_rabbit_t *g, uint16_t seed)
 static void vivint_rabbit_key_setup(vivint_rabbit_t *g)
 {
     /* 2.3.  Key Setup Scheme
-    
+
      The counter carry bit b is initialized to zero.  The state and
      counter words are derived from the key K[127..0].
-    
+
      The key is divided into subkeys K0 = K[15..0], K1 = K[31..16], ... K7
      = K[127..112].  The initial state is initialized as follows:
-    
+
        for j=0 to 7:
          if j is even:
            Xj = K(j+1 mod 8) || Kj
@@ -200,7 +205,7 @@ static void vivint_rabbit_update_counters(vivint_rabbit_t *g)
 
     const uint32_t A[8] = {0x4D34D34D, 0xD34D34D3, 0x34D34D34, 0x4D34D34D, 0xD34D34D3, 0x34D34D34, 0x4D34D34D, 0xD34D34D3};
 
-    for (int j=0u; j<8; j++) 
+    for (int j=0u; j<8; j++)
     {
         uint64_t temp = (uint64_t)(g->C[j]) + (uint64_t)(A[j]) + (uint64_t)(g->b);
         g->b = temp / 0x100000000;
@@ -300,9 +305,9 @@ static void vivint_rabbit_extract(vivint_rabbit_t *g)
 // out should be a uint8_t[48]
 static void vivint_rabbit_gen_cipher(vivint_rabbit_t *g, uint8_t *out)
 {
-  
+
     vivint_rabbit_key_setup(g);
-  
+
     // Iterate 4 times before extracting secrets
     for (int i=0; i < 4; i++)
     {
@@ -311,7 +316,7 @@ static void vivint_rabbit_gen_cipher(vivint_rabbit_t *g, uint8_t *out)
     }
     // Necessary step before extracting the secrets
     vivint_rabbit_reinitialize_counters(g);
-    
+
     // Now we pull out all 48 bytes of data for the cipher
     // auto out = ret.begin();
     for (int i=0; i<3; i++)
@@ -356,6 +361,7 @@ typedef struct {
     uint16_t last_counter;
     uint8_t cipher[VIVINT_RABBIT_CIPHER_SIZE];
     int counter_idx;
+    int seed_matches;
     uint16_t counters[VIVINT_CACHED_COUNTERS];
     uint8_t cipher_cache[VIVINT_CACHED_COUNTERS];
 } vivint_sensor_t;
@@ -467,7 +473,7 @@ static int vivint_decrypt_flags(vivint_sensor_t *s, int flags, uint16_t counter)
 }
 
 /* Iterates through cached data from a sensor to determine the seed */
-static int vivint_determine_seed(vivint_sensor_t *s)
+static int vivint_determine_seed(r_device *decoder, vivint_sensor_t *s)
 {
     int num_matches = 0;
     uint16_t matched_seed = 0xffff;
@@ -476,13 +482,11 @@ static int vivint_determine_seed(vivint_sensor_t *s)
         s->last_counter = 0xffff;
         for (int i = 0; i < 6; i++)
         {
+            int idx = (s->counter_idx - 6 + i) % VIVINT_CACHED_COUNTERS;
             s->seed = seed;
-            vivint_rabbit_advance_cipher(s, s->counters[i]);
-            if (!vivint_validate_rabbit_nibble(s, s->cipher_cache[i], s->counters[i]))
+            vivint_rabbit_advance_cipher(s, s->counters[idx]);
+            if (!vivint_validate_rabbit_nibble(s, s->cipher_cache[idx], s->counters[idx]))
             {
-                // if (i > 0) {
-                  // printf("Not this seed after: %d\n", i);
-                // }
                 break;
             }
             if (i == 5)
@@ -493,9 +497,11 @@ static int vivint_determine_seed(vivint_sensor_t *s)
         }
     }
 
+    s->seed_matches = num_matches;
+
     if (num_matches == 1)
     {
-        printf("Determined seed: %x\n", matched_seed);
+        decoder_logf(decoder, 1, __func__, "Determined seed: %x", (unsigned)matched_seed);
         s->seed = matched_seed;
         // Reset the last counter so it regenerates the cipher with the new key
         s->last_counter = 0xffff;
@@ -568,6 +574,10 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     snprintf(id_str, sizeof(id_str), "%04u-%07u", (id >> 20) & 0xfff, id & 0xfffff);
 
     int has_valid_flags  = 0;
+    uint16_t seed        = 0xffff;
+    int seed_data_count  = 0;
+    int seed_matches     = -1;
+    char const *decode_status = "unsupported_event_type";
 
     int loop1_bit       = 0;    // Loop 1, PIR motion, external contact for DW11, and reed for DW21R
     int tamper_bit      = 0;    // Case open tamper
@@ -592,9 +602,11 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
                 s->seed          = 0xffff;
                 s->last_counter  = 0xffff;
                 s->counter_idx   = 0;
+                s->seed_matches  = -1;
             }
         }
         if (s) {
+            decode_status = "collecting_seed";
             // Let's see if we can determine the seed
             if (s->seed == 0xffff || s->seed == 0x0000)
             {
@@ -602,24 +614,24 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
                 // Prevent duplicates
                 if (counter != s->last_counter)
                 {
-                    int idx = s->counter_idx % VIVINT_RABBIT_CIPHER_SIZE;
+                    int idx = s->counter_idx % VIVINT_CACHED_COUNTERS;
                     s->cipher_cache[idx] = cipher_nibble;
                     s->counters[idx] = counter;
                     s->counter_idx++;
                     // Check if we have enough data to determine the seed
                     if (s->counter_idx >= 6)
                     {
-                        printf("Attempting to crack seed\n");
-                        vivint_determine_seed(s);
+                        decoder_logf(decoder, 1, __func__, "Attempting to crack seed");
+                        vivint_determine_seed(decoder, s);
                     }
                 }
                 s->last_counter = counter;
             }
 
-            if (s->seed != 0xffff && s->seed != 0x0000) 
+            if (s->seed != 0xffff && s->seed != 0x0000)
             {
                 // This is where we try to decode the message
-                // We also need to check the high nibble of byte 8 to check if 
+                // We also need to check the high nibble of byte 8 to check if
                 // the cipher is correct
                 vivint_rabbit_advance_cipher(s, counter);
                 if (vivint_validate_rabbit_nibble(s, cipher_nibble, counter))
@@ -637,10 +649,24 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
                     battery_low_bit = flags & 0x08 ? 1 : 0;
                     heartbeat_bit   = flags & 0x04 ? 1 : 0;
                 } else {
+                    decode_status = "cipher_check_failed";
                     decoder_logf(decoder, 2, __func__, "Invalid Rabbit cipher check nibble");
                 }
             }
+            seed = s->seed;
+            seed_data_count = s->counter_idx < VIVINT_CACHED_COUNTERS ? s->counter_idx : VIVINT_CACHED_COUNTERS;
+            seed_matches = s->seed_matches;
+            if (has_valid_flags) {
+                decode_status = "decoded";
+            }
+            else if (seed == 0xffff || seed == 0x0000) {
+                if (seed_matches == 0)
+                    decode_status = "seed_not_found";
+                else if (seed_matches > 1)
+                    decode_status = "seed_ambiguous";
+            }
         } else {
+            decode_status = "sensor_cache_full";
         }
     }
 
@@ -673,6 +699,11 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             "model",        "",              DATA_STRING, model,
             "id",           "",              DATA_STRING, id_str,
             "counter",      "",              DATA_FORMAT, "%04x", DATA_INT, counter,
+            "seed",         "",              DATA_COND, seed != 0xffff && seed != 0x0000, DATA_FORMAT, "%04x", DATA_INT, seed,
+            "decode_status", "Decode status", DATA_STRING, decode_status,
+            "seed_data_count", "Seed samples collected", DATA_COND, seed == 0xffff || seed == 0x0000, DATA_INT, seed_data_count,
+            "seed_data_required", "Seed samples required", DATA_COND, seed == 0xffff || seed == 0x0000, DATA_INT, 6,
+            "seed_candidate_count", "Seed candidates", DATA_COND, (seed == 0xffff || seed == 0x0000) && seed_matches >= 0, DATA_INT, seed_matches,
             "flags",        "",              DATA_FORMAT, "%02x", DATA_INT, flags,
             "event_type",   "",              DATA_FORMAT, "%02x", DATA_INT, event_type,
             "state",        "",              DATA_COND, has_valid_flags,  DATA_STRING, loop1_bit ? "open" : "closed",
@@ -695,6 +726,11 @@ static char const *const output_fields[] = {
         "model",
         "id",
         "counter",
+        "seed",
+        "decode_status",
+        "seed_data_count",
+        "seed_data_required",
+        "seed_candidate_count",
         "flags",
         "event_type",
         "state",

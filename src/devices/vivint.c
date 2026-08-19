@@ -51,13 +51,35 @@ The decoder also identifies PIR2 motion and GB2 glass-break frame types.
 OOK Manchester (zerobit), 0xFFFE preamble, 96 bit (12 byte) packet. Decoded
 payload (80 data bits, 10 bytes) after the preamble:
 
+    For the 0xd0 messages:
+
+    TT BB NN BB II II II II RR RR
+
+    For the 0x74, 0x79, and 0x7a messages:
+
     TT CC CC FF II II II II RR RR
 
-- T: 8 bit frame subtype: 0x7a = DW11 door/window, 0x79 = GB2 glass-break,
-     0x74 = PIR2 motion, 0x72/0x73/0x76 = other sensor families,
+
+- T: 8 bit frame subtype:
+     0x74 = PIR motion
+     0x79 = GB glass-break
+     0x7a = DW door/window
      0xd0 = power-on/startup beacon
+     0x72 = Heartbeat message
+     0x73 = Raw seed value
+     0x76 = Used during manufacturing bringup
+
+- N: 8 bit constant used to identify the type of device
+     0x0a: V-PIR2-345
+     0x0f: V-DW21R-345
+     0x14: V-GB2-345
+     0x18: V-DW11-345
+
+- B: 16 bit value that gives a device specific battery level
+
 - C: 16 bit counter, increments every transmission
-- F: 8 bit status byte. The low 2 bits are always zero; the rest (including
+
+- F: 8 bit status byte. The low 2 bits are always zero for a standard encrypted message; the rest (including
      bit 7, open/closed for 0x7a) are XORed with a per-device keystream,
      see below
 - I: 32 bit device identifier
@@ -787,7 +809,7 @@ static char const *const output_fields[] = {
 };
 
 r_device const vivint = {
-        .name        = "Vivint Door/Window Sensor, V-DW21R-345/V-DW11-345",
+        .name        = "Vivint 345MHz Sensors, V-DW11-345/V-DW21R-345, V-GB2-345, V-PIR2-345",
         .modulation  = OOK_PULSE_MANCHESTER_ZEROBIT,
         .short_width = 150,
         .long_width  = 0,

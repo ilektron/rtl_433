@@ -9,6 +9,7 @@
     (at your option) any later version.
 */
 
+#include "data.h"
 #include "decoder.h"
 
 #include <stdint.h>
@@ -30,11 +31,21 @@
 #if VIVINT_SEED_DATA_REQUIRED < 1 || VIVINT_SEED_DATA_REQUIRED > VIVINT_CACHED_COUNTERS
 #error "VIVINT_SEED_DATA_REQUIRED must be between 1 and VIVINT_CACHED_COUNTERS"
 #endif
-#define VIVINT_ENTRY_COUNTER      0x17
-#define VIVINT_RABBIT_CIPHER_SIZE 48
-#define VIVINT_EVENT_DW           0x7a
-#define VIVINT_EVENT_PIR          0x74
-#define VIVINT_EVENT_GB           0x79
+// TODO  #define VIVINT_CHANNEL 0x70
+#define VIVINT_ENTRY_COUNTER           0x17
+#define VIVINT_RABBIT_CIPHER_SIZE      48
+#define VIVINT_PACKET_STARTUP          0xd0
+#define VIVINT_PACKET_BATTERY          0x72
+#define VIVINT_PACKET_SEED             0x73
+#define VIVINT_PACKET_MFG_BOOT         0x76
+#define VIVINT_PACKET_EVENT_DW         0x7a
+#define VIVINT_PACKET_EVENT_PIR        0x74
+#define VIVINT_PACKET_EVENT_GB         0x79
+
+#define VIVINT_DEVICE_TYPE_V_PIR2_345  0x0a
+#define VIVINT_DEVICE_TYPE_V_DW21R_345 0x0f
+#define VIVINT_DEVICE_TYPE_V_GB2_345   0x14
+#define VIVINT_DEVICE_TYPE_V_DW11_345  0x18
 
 // Include seed and seed-discovery diagnostics in decoder output by default.
 // Define OUTPUT_VIVINT_DECODE=0 to omit these fields from emitted data.
@@ -59,6 +70,8 @@ payload (80 data bits, 10 bytes) after the preamble:
 
     TT CC CC FF II II II II RR RR
 
+    For the 0x72, 0x73, and 0x76 messages,
+
 
 - T: 8 bit frame subtype:
      0x74 = PIR motion
@@ -74,11 +87,11 @@ payload (80 data bits, 10 bytes) after the preamble:
      0x0f: V-DW21R-345
      0x14: V-GB2-345
      0x18: V-DW11-345
+     Other unknown device values are the V-PIR3-345, V-GB3-345, keyfobs, flood, and some other sensors
 
 - B: 16 bit value that gives a device specific battery level
 
 - C: 16 bit counter, increments every transmission
-
 - F: 8 bit status byte. The low 2 bits are always zero for a standard encrypted message; the rest (including
      bit 7, open/closed for 0x7a) are XORed with a per-device keystream,
      see below
@@ -154,8 +167,6 @@ See https://github.com/merbanan/rtl_433/issues/1504
    modeled as a flat byte window. Custom to this protocol (not part of
    RFC 4503): a 16-bit seed in place of Rabbit's 128-bit key/IV, and a
    per-packet schedule keyed off the transmission counter. */
-/* Technically, we could just cache the key and the secrets. The states
-   are generated every 12 packets */
 typedef struct {
     uint32_t C[8];
     uint32_t X[8];
@@ -176,6 +187,7 @@ static uint32_t vivint_rotl32(uint32_t x, unsigned n)
     return (x << n) | (x >> (32 - n));
 }
 
+/* Base of the rabbit cipher function 'g' */
 static uint32_t vivint_rabbit_g(uint32_t u, uint32_t v)
 {
     uint64_t sq = u + v;
@@ -352,8 +364,8 @@ static void vivint_rabbit_extract(vivint_rabbit_t *g)
     g->S[7] = ((g->X[6] >> 16) & 0xffff) ^ (g->X[1] & 0xffff);
 }
 
-// Generate the 48 bytes of cipher given a specific key
-// out should be a uint8_t[48]
+/* Generate the 48 bytes of cipher given a specific key
+   out should be a uint8_t[48] */
 static void vivint_rabbit_gen_cipher(vivint_rabbit_t *g, uint8_t *out)
 {
 
@@ -384,7 +396,8 @@ static void vivint_rabbit_gen_cipher(vivint_rabbit_t *g, uint8_t *out)
     }
 }
 
-// Customization to the rabbit cipher that modifies the 128bit key based on the packet counter
+/* Customization to the rabbit cipher that modifies the 128bit key based on the packet counter
+ * This makes the key seem like it is more than 16 bits */
 static void vivint_gen_rabbit_key(vivint_rabbit_t *g, uint16_t seed, uint16_t counter)
 {
     uint16_t i = 24;
@@ -494,6 +507,7 @@ static r_device *vivint_create(char const *args)
     return dev;
 }
 
+// Generates the cipher values given a specific seed and counter
 static void vivint_rabbit_advance_cipher(vivint_sensor_t *s, uint16_t counter)
 {
     // Need to check to see if we need to regenerate our cipher output
@@ -605,11 +619,15 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 
     int crc_valid = 0;
     // TODO add the other packet types that don't use the 12bit crc
-    if (event_type == 0xd0) {
-        if (crc == crc16(b, 8, 0x8050, 0))
-            crc_valid = 1;
-    }
-    else {
+
+    switch (event_type) {
+    case VIVINT_PACKET_EVENT_DW:
+    case VIVINT_PACKET_EVENT_GB:
+    case VIVINT_PACKET_EVENT_PIR:
+        // These packets are similar to the EVENT packets, but have a multiple of 797 in the high nibble
+    case VIVINT_PACKET_BATTERY:
+    case VIVINT_PACKET_SEED:
+    case VIVINT_PACKET_MFG_BOOT:
         uint8_t b8_full = b[8];
         b[8] &= 0xF0;
         int crc_full = crc16(b, 9, 0x8050, 0);
@@ -618,6 +636,13 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         int stored12 = ((b8_full & 0x0F) << 8) | b[9];
         if (check12 == stored12)
             crc_valid = 1;
+        break;
+
+    case VIVINT_PACKET_STARTUP:
+    default:
+        if (crc == crc16(b, 8, 0x8050, 0))
+            crc_valid = 1;
+        break;
     }
 
     if (!crc_valid) {
@@ -629,6 +654,7 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     snprintf(id_str, sizeof(id_str), "%04u-%07u", (id >> 20) & 0xfff, id & 0xfffff);
 
     int has_valid_flags       = 0;
+    int has_startup_data      = 0;
     uint16_t seed             = 0xffff;
     int seed_data_count       = 0;
     int seed_matches          = -1;
@@ -641,8 +667,30 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     int battery_low_bit = 0; // Tested
     int heartbeat_bit   = 0; // Bit that toggles at a timed interval based on sum of 797
 
-    // TODO: Should work on other packets as well.
-    if (event_type == 0x7a || event_type == 0x74 || event_type == 0x79) {
+    int battery_level   = 0; // Reported raw battery level
+    int battery_threshold  = 0; // Threshold given that corresponds to the battery level for a low battery event
+
+
+    // While the event can give a class of device, the 0xd0 message
+    // can tell us exactly which device it is
+    const char *model = "Vivint Security";
+
+    // Add event types here for other devices
+    if (event_type == VIVINT_PACKET_EVENT_DW || event_type == VIVINT_PACKET_EVENT_GB || event_type == VIVINT_PACKET_EVENT_PIR) {
+
+        switch (event_type) {
+        case VIVINT_PACKET_EVENT_DW:
+            model = "Vivint Security V-DW11-345/V-DW21R-345";
+            break;
+        case VIVINT_PACKET_EVENT_PIR:
+            model = "Vivint Security V-PIR2-345/V-PIR3-345";
+            break;
+        case VIVINT_PACKET_EVENT_GB:
+            model = "Vivint Security V-GB2-345/V-GB3-345";
+            break;
+        default:
+            break;
+        }
 
         // TODO Should check bit 1 of the event data to see if this packet is encrypted
         vivint_sensor_t *s = vivint_ctx_find((vivint_ctx_t *)decoder_user_data(decoder), id);
@@ -720,27 +768,33 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             decode_status = "sensor_cache_full";
         }
     }
+    else if (event_type == VIVINT_PACKET_STARTUP) {
+        //
+        has_startup_data = 1;
+        int device_type  = b[2];
+        switch (device_type) {
+        case VIVINT_DEVICE_TYPE_V_DW11_345:
+            model = "Vivint Security V-DW11-345";
+            break;
+        case VIVINT_DEVICE_TYPE_V_DW21R_345:
+            model = "Vivint Security V-DW21R-345";
+            break;
+        case VIVINT_DEVICE_TYPE_V_GB2_345:
+            model = "Vivint Security V-GB2-345";
+            break;
+        case VIVINT_DEVICE_TYPE_V_PIR2_345:
+            model = "Vivint Security V-PIR2-345";
+            break;
+        default:
+            break;
+        }
+        battery_level = (b[1] << 8) | b[3];
+    }
 
     char payload[21];
     if (!has_valid_flags) {
         for (int i = 0; i < 10; ++i)
             snprintf(&payload[i * 2], 3, "%02x", b[i]);
-    }
-
-    // TODO move this somewhere more appropriate
-    const char *model = "Vivint-Security";
-    switch (event_type) {
-    case VIVINT_EVENT_DW:
-        model = "Vivint-Security DW11 or DW21R";
-        break;
-    case VIVINT_EVENT_PIR:
-        model = "Vivint-Security PIR2";
-        break;
-    case VIVINT_EVENT_GB:
-        model = "Vivint-Security GB";
-        break;
-    default:
-        break;
     }
 
 #if OUTPUT_VIVINT_DECODE
@@ -752,12 +806,11 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     (void)decode_status;
 #endif
 
-    // TODO change the model to match the device type
     /* clang-format off */
     data_t *data = data_make(
             "model",        "",              DATA_STRING, model,
             "id",           "",              DATA_STRING, id_str,
-            "counter",      "",              DATA_FORMAT, "%04x", DATA_INT, counter,
+            "counter",      "",              DATA_COND, has_valid_flags, DATA_FORMAT, "%04x", DATA_INT, counter,
 #if OUTPUT_VIVINT_DECODE
             "seed",         "",              DATA_COND, seed != 0xffff && seed != 0x0000, DATA_STRING, seed_str,
             "decode_status", "Decode status", DATA_STRING, decode_status,
@@ -765,7 +818,7 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             "seed_data_required", "Seed samples required", DATA_COND, seed == 0xffff || seed == 0x0000, DATA_INT, VIVINT_SEED_DATA_REQUIRED,
             "seed_candidate_count", "Seed candidates", DATA_COND, (seed == 0xffff || seed == 0x0000) && seed_matches >= 0, DATA_INT, seed_matches,
 #endif
-            "flags",        "",              DATA_FORMAT, "%02x", DATA_INT, flags,
+            "flags",        "",              DATA_COND, has_valid_flags, DATA_FORMAT, "%02x", DATA_INT, flags,
             "event_type",   "",              DATA_FORMAT, "%02x", DATA_INT, event_type,
             "state",        "",              DATA_COND, has_valid_flags,  DATA_STRING, loop1_bit ? "open" : "closed",
             "loop1",        "",              DATA_COND, has_valid_flags,  DATA_INT,     loop1_bit,
@@ -809,7 +862,7 @@ static char const *const output_fields[] = {
 };
 
 r_device const vivint = {
-        .name        = "Vivint 345MHz Sensors, V-DW11-345/V-DW21R-345, V-GB2-345, V-PIR2-345",
+        .name        = "Vivint 345MHz Sensors, V-DW11-345/V-DW21R-345, V-GB2-345/V-GB3-345, V-PIR2-345/V-PIR3-345",
         .modulation  = OOK_PULSE_MANCHESTER_ZEROBIT,
         .short_width = 150,
         .long_width  = 0,

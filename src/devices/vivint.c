@@ -667,9 +667,8 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     int battery_low_bit = 0; // Tested
     int heartbeat_bit   = 0; // Bit that toggles at a timed interval based on sum of 797
 
-    int battery_level   = 0; // Reported raw battery level
-    int battery_threshold  = 0; // Threshold given that corresponds to the battery level for a low battery event
-
+    int battery_level     = 0; // Reported raw battery level
+    int battery_threshold = 0; // Threshold given that corresponds to the battery level for a low battery event
 
     // While the event can give a class of device, the 0xd0 message
     // can tell us exactly which device it is
@@ -789,6 +788,7 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             break;
         }
         battery_level = (b[1] << 8) | b[3];
+    } else if (event_type = VIVINT_PACKET_BATTERY) {
     }
 
     char payload[21];

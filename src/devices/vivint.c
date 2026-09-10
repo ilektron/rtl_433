@@ -663,7 +663,7 @@ static int vivint_decode_poweron(r_device *decoder, uint8_t *b)
         model = "Vivint Security V-PIR2-345";
         break;
     default:
-        model = "Vivint Security Unrecognized Sensor";
+        model = "Vivint Security";
         break;
     }
 
@@ -676,7 +676,7 @@ static int vivint_decode_poweron(r_device *decoder, uint8_t *b)
     data_t *data = data_make(
             "id",              "TXID",          DATA_STRING, id_str,
             "event",           "Event",         DATA_STRING, "power_on",
-            "model",           "Device Type",   DATA_STRING, model,
+            "model",           "",              DATA_STRING, model,
             "battery_level",   "",              DATA_INT, battery_level,
             "mic",             "Integrity",     DATA_STRING, "CRC",
             NULL);
@@ -696,6 +696,7 @@ static int vivint_decode_battery(r_device *decoder, uint8_t *b, const char *id_s
 
     /* clang-format off */
     data_t *data = data_make(
+            "model",             "",              DATA_STRING, "Vivint Security",
             "id",                "TXID",          DATA_STRING, id_str,
             "event",             "Event",         DATA_STRING, "battery",
             "battery_level",     "",              DATA_INT, bat_level,
@@ -722,6 +723,8 @@ static int vivint_decode_unknown(r_device *decoder, uint8_t *b)
 
     /* clang-format off */
     data_t *data = data_make(
+            "model",             "",              DATA_STRING, "Vivint Security",
+            "id",                "",              DATA_STRING, "0000-000-0000",
             "event",             "Event",         DATA_STRING, "unknown",
             "data",              "",              DATA_STRING,  payload,
             "mic",               "Integrity",     DATA_STRING, "CRC",
@@ -756,6 +759,7 @@ static int vivint_decode_mfg_boot(r_device *decoder, uint8_t *b, const char *id_
 
     /* clang-format off */
     data_t *data = data_make(
+            "model",             "",              DATA_STRING, "Vivint Security",
             "id",                "TXID",          DATA_STRING, id_str,
             "counter",           "",              DATA_INT,    counter,
             "event",             "Event",         DATA_STRING, "battery",
@@ -806,6 +810,7 @@ static int vivint_decode_seed(r_device *decoder, uint8_t *b, int id, const char 
 
     /* clang-format off */
     data_t *data = data_make(
+            "model",           "",              DATA_STRING, "Vivint Security",
             "id",              "TXID",          DATA_STRING, id_str,
             "event",           "Event",         DATA_STRING, "seed",
             "seed",            "",              DATA_INT, seed_str,
@@ -970,6 +975,7 @@ static int vivint_decode_event(r_device *decoder, uint8_t *b, int id, const char
 
     /* clang-format off */
     data_t *data = data_make(
+            "model",        "",              DATA_STRING, "Vivint Security",
             "id",           "TXID",          DATA_STRING, id_str,
             "counter",      "",              DATA_COND, has_valid_flags, DATA_FORMAT, "%04x", DATA_INT, counter,
 #if OUTPUT_VIVINT_DECODE

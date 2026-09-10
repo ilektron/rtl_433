@@ -40,22 +40,28 @@
 
 #define CHANNEL_VIVINT            0x70
 #define CHANNEL_POWERON           0xd0
+#define CHANNEL_SKEY              0xe0
 #define CHANNEL_LEGACY            0xf0
 
 /* Some devices will send a packet without encrypted status data
  This could be a change in device configuration or some devices
  may just not use the encryted options */
 /* The following values only apply to vivint devices */
-#define VIVINT_EVENT_UNENCRYPTED  0x01
-#define VIVINT_PACKET_BATTERY     0x02
-#define VIVINT_PACKET_SEED        0x03
-#define VIVINT_EVENT_PIR          0x04
-#define VIVINT_PACKET_MFG_BOOT    0x06
-#define VIVINT_EVENT_FLOOD        0x07
-#define VIVINT_EVENT_GB           0x09
-#define VIVINT_EVENT_DW           0x0a
+#define VIVINT_EVENT_UNENCRYPTED 0x01
+#define VIVINT_PACKET_BATTERY    0x02
+#define VIVINT_PACKET_SEED       0x03
+// For some reason the flood sensor will send out a 0x74 packet when the WPS/Pair button is pressed
+// It looks like b[1] is the temperature in C when the flood sensor sends a 0x74. Additionally, the
+// bit that is cleared when the packet is encrypted is set, signifying a change in format where the
+// counter should be.
+#define VIVINT_EVENT_PIR       0x04
+#define VIVINT_PACKET_MFG_BOOT 0x06
+#define VIVINT_EVENT_FLOOD     0x07
+#define VIVINT_EVENT_GB        0x09
+#define VIVINT_EVENT_DW        0x0a
 
-#define VIVINT_ENCRYPTED_FLAG_BIT 0x02
+/* This bit in b[3] can change the meaning of a packet to include values */
+#define VIVINT_UNENCRYPTED_FLAG_BIT 0x02
 
 /* Sent with the 0xd0 packet */
 #define VIVINT_DEVICE_TYPE_V_PIR2_345    0x0a
@@ -187,7 +193,7 @@ When OUTPUT_VIVINT_DECODE is enabled (the default), a configured or discovered
 seed is reported in `seed` as a four-character hexadecimal string along with
 the seed-discovery status fields; set it to 0 to omit them. Valid seeds and
 authentication nibbles emit the decrypted `state`, `loop1`, `tamper`, `loop2`,
-`alarm`, `battery_low`, and `heartbeat` fields. Otherwise, `data` contains the
+`loop3`, `battery_low`, and `heartbeat` fields. Otherwise, `data` contains the
 raw payload.
 
 For example, create `vivint-defines.cmake` in the source directory to supply a
@@ -661,16 +667,15 @@ static int vivint_decode_poweron(r_device *decoder, uint8_t *b)
         break;
     }
 
-    if (crc == crc16(b, 8, 0x8050, 0)) {
+    if (crc != crc16(b, 8, 0x8050, 0)) {
         decoder_logf(decoder, 2, __func__, "CRC check failed");
         return DECODE_FAIL_MIC;
     }
 
-
     /* clang-format off */
     data_t *data = data_make(
             "id",              "TXID",          DATA_STRING, id_str,
-            "event",           "Event",         DATA_STRING, "power on",
+            "event",           "Event",         DATA_STRING, "power_on",
             "model",           "Device Type",   DATA_STRING, model,
             "battery_level",   "",              DATA_INT, battery_level,
             "mic",             "Integrity",     DATA_STRING, "CRC",
@@ -679,11 +684,141 @@ static int vivint_decode_poweron(r_device *decoder, uint8_t *b)
 
     decoder_output_data(decoder, data);
 
-
-    return -1;
+    return 1;
 }
 
-static int vivint_decode_event(r_device *decoder, uint8_t *b, int id, const char *id_str,int event, int has_encrypted_flags)
+/* This packet is device specific, and contains stuff like counter for RC circuits and register settings for voltage monitors on MSP430s */
+static int vivint_decode_battery(r_device *decoder, uint8_t *b, const char *id_str)
+{
+    /* This might not be true for all device types */
+    int bat_level     = ((b[1] << 4) & 0x0ff0) | b[2] >> 4;
+    int bat_threshold = ((b[2] & 0x0f) << 4) | (b[3] >> 2);
+
+    /* clang-format off */
+    data_t *data = data_make(
+            "id",                "TXID",          DATA_STRING, id_str,
+            "event",             "Event",         DATA_STRING, "battery",
+            "battery_level",     "",              DATA_INT, bat_level,
+            "battery_threshold", "",              DATA_INT, bat_threshold,
+            "mic",               "Integrity",     DATA_STRING, "CRC",
+            NULL);
+    /* clang-format on */
+
+    decoder_output_data(decoder, data);
+
+    return 1;
+}
+
+/* For devices that are not yet included in this decoder.
+ * If you have a device that generates this type of message,
+ * consider creating an issue with some captured data */
+static int vivint_decode_unknown(r_device *decoder, uint8_t *b)
+{
+    char payload[21];
+
+    for (int i = 0; i < 10; ++i) {
+        snprintf(&payload[i * 2], 3, "%02x", b[i]);
+    }
+
+    /* clang-format off */
+    data_t *data = data_make(
+            "event",             "Event",         DATA_STRING, "unknown",
+            "data",              "",              DATA_STRING,  payload,
+            "mic",               "Integrity",     DATA_STRING, "CRC",
+            NULL);
+    /* clang-format on */
+
+    decoder_output_data(decoder, data);
+
+    return 1;
+}
+
+/* Sent while upgrading to encrypted communication
+ * Unknown exactly what the counter means, but once it
+ * reaches 25, it upgrades the device to encrypted communication.
+ * Probably set within 60 seconds of powering on the device with
+ * tamper or another input. */
+static int vivint_decode_mfg_boot(r_device *decoder, uint8_t *b, const char *id_str)
+{
+    int counter  = ((b[3] >> 2) & 0x0ff) | (b[1] & 0x0001);
+    int val_0xca = b[2];        // Should be 0xca
+    int val_0x34 = b[1] & 0xfe; // Should be 0x34
+
+    if (!(b[3] & 0x02) && val_0x34 != 0x34 && val_0xca != 0xca) {
+        decoder_logf(decoder, 2, __func__, "Non-conforming mfg boot packet format");
+        return DECODE_FAIL_SANITY;
+    }
+
+    char payload[21];
+    for (int i = 0; i < 10; ++i) {
+        snprintf(&payload[i * 2], 3, "%02x", b[i]);
+    }
+
+    /* clang-format off */
+    data_t *data = data_make(
+            "id",                "TXID",          DATA_STRING, id_str,
+            "counter",           "",              DATA_INT,    counter,
+            "event",             "Event",         DATA_STRING, "battery",
+            "data",              "",              DATA_STRING,  payload,
+            "mic",               "Integrity",     DATA_STRING, "CRC",
+            NULL);
+    /* clang-format on */
+
+    decoder_output_data(decoder, data);
+
+    return 1;
+}
+
+/* Untested, difficult to get devices to trigger this output */
+static int vivint_decode_seed(r_device *decoder, uint8_t *b, int id, const char *id_str)
+{
+    uint8_t two   = b[3];
+    uint16_t seed = (b[1] << 8) | b[2]; // Useful data included in packet
+
+    if (two != 0x02) {
+        decoder_logf(decoder, 2, __func__, "Non-conforming seed packet format");
+        return DECODE_FAIL_SANITY;
+    }
+    //
+    vivint_sensor_t *s = vivint_ctx_find((vivint_ctx_t *)decoder_user_data(decoder), id);
+    if (!s) {
+        vivint_ctx_t *ctx = (vivint_ctx_t *)decoder_user_data(decoder);
+        if (ctx->count < VIVINT_MAX_SENSORS) {
+            s               = &ctx->sensors[ctx->count++];
+            s->id           = id;
+            s->seed         = seed;
+            s->last_counter = 0xffff;
+            s->counter_idx  = 0;
+            s->seed_matches = 1;
+        }
+    }
+    else {
+        if (s->seed == 0xffff || s->seed == 0) {
+            s->seed = seed;
+        }
+        else if (s->seed != seed) {
+            s->seed = seed;
+        }
+    }
+
+    char seed_str[5];
+    snprintf(seed_str, sizeof(seed_str), "%04x", seed);
+
+    /* clang-format off */
+    data_t *data = data_make(
+            "id",              "TXID",          DATA_STRING, id_str,
+            "event",           "Event",         DATA_STRING, "seed",
+            "seed",            "",              DATA_INT, seed_str,
+            "mic",             "Integrity",     DATA_STRING, "CRC",
+            NULL);
+    /* clang-format on */
+
+    decoder_output_data(decoder, data);
+
+    return 1;
+}
+
+static int vivint_decode_event(r_device *decoder, uint8_t *b, int id, const char *id_str, int event, int has_encrypted_flags)
 {
     int flags         = b[3];        // Useful data included in packet
     int cipher_nibble = b[8] & 0xf0; // For encrypted messages, contains 4 bits of the cipher
@@ -691,24 +826,26 @@ static int vivint_decode_event(r_device *decoder, uint8_t *b, int id, const char
     int loop1_bit       = 0; // Loop 1, PIR motion, external contact for DW11, and reed for DW21R
     int tamper_bit      = 0; // Case open tamper
     int loop2_bit       = 0; // Loop 2, or reed for DW11
-    int alarm_bit       = 0; // Unused
-    int battery_low_bit = 0; // Tested
+    int loop3_bit       = 0; // Loop 3, or freeze for FLD001
+    int battery_low_bit = 0; // Does the sensor have a low battery voltage?
     int heartbeat_bit   = 0; // Bit that toggles at a timed interval based on sum of 797
     int counter         = 0; // For encrypted packets, we need to track this counter because it tells us where in the cipher the packet is
-    int has_valid_flags = 0; // Did we appropriately decode the flags?
+    int has_valid_flags = 0; // Were the flags appropriately decoded?
 
-    uint16_t seed             = 0xffff;
-    int seed_data_count       = 0;
-    int seed_matches          = -1;
-    char const *decode_status = "unsupported_event_type";
+    uint16_t seed       = 0xffff;
+    int seed_data_count = 0;
+    int seed_matches    = -1;
 
+    const char *decode_status = "unknown";
     const char *event_str;
+
     char payload[21];
 
-    // Let's check if we can decode the flags
     if (has_encrypted_flags) {
-        /* The bit[1] of the flags tells if the event data is encrypted or not and is always low when encrypted */
-        if (!(flags & VIVINT_ENCRYPTED_FLAG_BIT)) {
+        /* The bit[1] of the flags tells if the event data is encrypted or not
+         * and is always low when encrypted and contains a counter */
+        if (!(flags & VIVINT_UNENCRYPTED_FLAG_BIT)) {
+            counter = (b[1] << 8) | b[2];
             // This means that we have the counter and need to work on decrypting
             vivint_sensor_t *s = vivint_ctx_find((vivint_ctx_t *)decoder_user_data(decoder), id);
             if (!s) {
@@ -773,6 +910,17 @@ static int vivint_decode_event(r_device *decoder, uint8_t *b, int id, const char
                 decode_status = "sensor_cache_full";
             }
         }
+        else {
+            /* Some devices include values here for different messages,
+             * for example the VS-FLD001-345 sends a 0x74 message with the current temperature in C. */
+
+            decode_status   = "unencrypted";
+            has_valid_flags = 0;
+        }
+    }
+    else {
+        decode_status   = "unencrypted";
+        has_valid_flags = 1;
     }
 
 #if OUTPUT_VIVINT_DECODE
@@ -786,13 +934,13 @@ static int vivint_decode_event(r_device *decoder, uint8_t *b, int id, const char
 
     switch (event) {
     case VIVINT_EVENT_DW:
-        event_str = "door or window open/close";
+        event_str = "door_window_open_close";
         break;
     case VIVINT_EVENT_FLOOD:
-        event_str = "flood, heat, or freeze";
+        event_str = "flood_heat_freeze";
         break;
     case VIVINT_EVENT_GB:
-        event_str = "glass break";
+        event_str = "glass_break";
         break;
     case VIVINT_EVENT_PIR:
         event_str = "motion";
@@ -802,15 +950,15 @@ static int vivint_decode_event(r_device *decoder, uint8_t *b, int id, const char
         break;
     }
 
-    if (has_valid_flags || !has_encrypted_flags) {
-        /* Extract DW11 event bits (CTRABHEZ layout):
-                   C=contact(7), T=tamper(6), R=reed(5), A=alarm(4),
+    if (has_valid_flags) {
+        /* Extract DW11 event bits (1T23BHEZ layout):
+                   1=loop1(7), T=tamper(6), 2=loop2(5), 3=loop3(4),
                    B=battery_low(3), H=heartbeat(2), E=Encrypted(1),
                    Z=zero(0) */
         loop1_bit       = flags & 0x80 ? 1 : 0;
         tamper_bit      = flags & 0x40 ? 1 : 0;
         loop2_bit       = flags & 0x20 ? 1 : 0;
-        alarm_bit       = flags & 0x10 ? 1 : 0;
+        loop3_bit       = flags & 0x10 ? 1 : 0;
         battery_low_bit = flags & 0x08 ? 1 : 0;
         heartbeat_bit   = flags & 0x04 ? 1 : 0;
     }
@@ -826,7 +974,7 @@ static int vivint_decode_event(r_device *decoder, uint8_t *b, int id, const char
             "counter",      "",              DATA_COND, has_valid_flags, DATA_FORMAT, "%04x", DATA_INT, counter,
 #if OUTPUT_VIVINT_DECODE
             "seed",         "",              DATA_COND, has_encrypted_flags && seed != 0xffff && seed != 0x0000, DATA_STRING, seed_str,
-            "decode_status", "Decode status", DATA_STRING, decode_status,
+            "decode_status", "Decode status", DATA_COND, has_encrypted_flags, DATA_STRING, decode_status,
             "seed_data_count", "Seed samples collected", DATA_COND, has_encrypted_flags && (seed == 0xffff || seed == 0x0000), DATA_INT, seed_data_count,
             "seed_data_required", "Seed samples required", DATA_COND, has_encrypted_flags && (seed == 0xffff || seed == 0x0000), DATA_INT, VIVINT_SEED_DATA_REQUIRED,
             "seed_candidate_count", "Seed candidates", DATA_COND, has_encrypted_flags && (seed == 0xffff || seed == 0x0000) && seed_matches >= 0, DATA_INT, seed_matches,
@@ -834,14 +982,14 @@ static int vivint_decode_event(r_device *decoder, uint8_t *b, int id, const char
             "flags",        "",              DATA_COND, has_valid_flags, DATA_FORMAT, "%02x", DATA_INT, flags,
             "event_type",   "",              DATA_FORMAT, "%02x", DATA_INT, event,
             "event",        "Event",         DATA_STRING, event_str,
-            "state",        "",              DATA_COND, has_valid_flags,  DATA_STRING, loop1_bit ? "open" : "closed",
+            "state",        "",              DATA_COND, has_valid_flags,  DATA_STRING,  loop1_bit ? "open" : "closed",
             "loop1",        "",              DATA_COND, has_valid_flags,  DATA_INT,     loop1_bit,
             "tamper",       "",              DATA_COND, has_valid_flags,  DATA_INT,     tamper_bit,
             "loop2",        "",              DATA_COND, has_valid_flags,  DATA_INT,     loop2_bit,
-            "alarm",        "",              DATA_COND, has_valid_flags,  DATA_INT,     alarm_bit,
+            "loop3",        "",              DATA_COND, has_valid_flags,  DATA_INT,     loop3_bit,
             "battery_low",  "Battery",       DATA_COND, has_valid_flags,  DATA_INT,     battery_low_bit,
             "heartbeat",    "",              DATA_COND, has_valid_flags,  DATA_INT,     heartbeat_bit,
-            "data",         "",              DATA_COND, !has_valid_flags, DATA_STRING, payload,
+            "data",         "",              DATA_COND, !has_valid_flags, DATA_STRING,  payload,
             "mic",          "Integrity",     DATA_STRING, "CRC",
             NULL);
     /* clang-format on */
@@ -865,6 +1013,7 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 
     bitbuffer_invert(bitbuffer);
 
+    /* This still misses a lot of packets when it catches a high bit at the start of the packet, leading to 0x80000 being seen instead of 0xfffe */
     int pos = bitbuffer_search(bitbuffer, row, 0, preamble_pattern, 12) + 12;
     int len = bitbuffer->bits_per_row[row] - pos;
     if (len < VIVINT_MSG_BIT_LEN) {
@@ -887,25 +1036,25 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     else if ((channel & 0xf0) == CHANNEL_VIVINT) {
         int has_encrypted_flags = 0;
 
-        // Contains the full 32bit TXID
+        /* Contains the full 32bit TXID */
         id = ((unsigned)b[4] << 24) | ((unsigned)b[5] << 16) | ((unsigned)b[6] << 8) | b[7];
         snprintf(id_str, sizeof(id_str), "%04u-%07u", (id >> 20) & 0xfff, id & 0xfffff);
 
-        // Check the CRC. Encrypted messages leak 4 bits of the raw cipher and unencrypted messages
-        // contain a multiple of 797 in those 4 bits.
+        /* Check the CRC. Encrypted messages leak 4 bits of the raw cipher and unencrypted messages
+           contain a multiple of 797 in those 4 bits. */
         int crc     = ((b[8] << 8) | b[9]) & 0x0fff;
         int b8_full = b[8];
 
         b[8] &= 0xf0;
-        if (crc == (crc16(b, 9, 0x8050, 0) >> 4)) {
+        if (crc != (crc16(b, 9, 0x8050, 0) >> 4)) {
             decoder_logf(decoder, 2, __func__, "CRC check failed");
             return DECODE_FAIL_MIC;
         }
         b[8] = b8_full;
 
-        // Check if we just have an unencrypted event. The high nibble of b[1] will be the actual event code
+        /* Check if we just have an unencrypted event. The high nibble of b[1] will be the actual event code */
         if (event == VIVINT_EVENT_UNENCRYPTED) {
-            // Check to see if the bit is set in the flags to signify not encrypted
+            /* Check to see if the bit is set in the flags to signify not encrypted */
             event = (b[1] & 0xf0) >> 4;
         }
         else {
@@ -913,28 +1062,47 @@ static int vivint_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         }
 
         if (event == VIVINT_PACKET_BATTERY) {
+            return vivint_decode_battery(decoder, b, id_str);
         }
         else if (event == VIVINT_PACKET_SEED) {
+            return vivint_decode_seed(decoder, b, id, id_str);
         }
         else if (event == VIVINT_PACKET_MFG_BOOT) {
+            return vivint_decode_mfg_boot(decoder, b, id_str);
         }
         else if (event == VIVINT_EVENT_DW || event == VIVINT_EVENT_GB || event == VIVINT_EVENT_PIR || event == VIVINT_EVENT_FLOOD) {
             return vivint_decode_event(decoder, b, id, id_str, event, has_encrypted_flags);
         }
         else {
-            // Unknown event!
+            decoder_logf(decoder, 2, __func__, "Unknown event type");
+            return DECODE_FAIL_OTHER;
         }
+    }
+    else if (channel == CHANNEL_SKEY) {
+        /* SKEY codes start with 0xe0 and then have the 24bit TXID */
+        decoder_logf(decoder, 2, __func__, "Unhandled device messages");
+        return DECODE_FAIL_OTHER;
     }
     else {
-        // Unhandled data, at this moment it includes skey2 messages and more
+        /* Check the possible known CRC configurations
+           Could change decoding behavior based on which crc is correct */
         int crc = (b[8] << 8) | b[9];
-        if (crc == crc16(b, 8, 0x8005, 0)) {
-            decoder_logf(decoder, 2, __func__, "CRC check failed");
-            return DECODE_FAIL_MIC;
+
+        if (crc != crc16(b, 8, 0x8005, 0) && crc != crc16(b, 8, 0x8050, 0)) {
+            crc         = ((b[8] << 8) | b[9]) & 0x0fff;
+            int b8_full = b[8];
+
+            b[8] &= 0xf0;
+            if (crc != (crc16(b, 9, 0x8050, 0) >> 4) && crc != (crc16(b, 9, 0x8005, 0) >> 4)) {
+                decoder_logf(decoder, 2, __func__, "CRC check failed");
+                return DECODE_FAIL_MIC;
+            }
+            b[8] = b8_full;
         }
+        return vivint_decode_unknown(decoder, b);
     }
 
-    return 1;
+    return DECODE_FAIL_OTHER;
 }
 
 static char const *const output_fields[] = {
@@ -954,7 +1122,7 @@ static char const *const output_fields[] = {
         "loop1",
         "tamper",
         "loop2",
-        "alarm",
+        "loop3",
         "battery_low",
         "heartbeat",
         "data",
@@ -967,9 +1135,9 @@ static char const *const output_fields[] = {
 r_device const vivint = {
         .name        = "Vivint 345MHz Sensors, V-DW11-345/V-DW21R-345, V-GB2-345/V-GB3-345, V-PIR2-345/V-PIR3-345",
         .modulation  = OOK_PULSE_MANCHESTER_ZEROBIT,
-        .short_width = 150,
-        .long_width  = 0,
-        .reset_limit = 300,
+        .short_width = 139,
+        .long_width  = 0,   /* Not used for manchester encoding */
+        .reset_limit = 300, /* Single sensors typically wait 10ms between sending packets */
         .decode_fn   = &vivint_decode,
         .create_fn   = &vivint_create,
         .fields      = output_fields,

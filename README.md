@@ -338,7 +338,7 @@ See [CONTRIBUTING.md](./docs/CONTRIBUTING.md).
     [242]* Baldr / RainPoint rain gauge.
     [243]  Celsia CZC1 Thermostat
     [244]  Fine Offset Electronics WS90 weather station
-    [245]* ThermoPro TX-2C Thermometer and Humidity sensor
+    [245]* ThermoPro TX-2C, TX-2B Thermometer and Humidity sensor
     [246]  TFA 30.3151 Weather Station
     [247]  Bresser water leakage
     [248]  Nissan TPMS
@@ -478,6 +478,8 @@ See [CONTRIBUTING.md](./docs/CONTRIBUTING.md).
     [382]* Cotech 36-7900 rain gauge
     [383]  Silver Spring Networks mesh endpoint (-s 1600k)
     [384]  Bresser SmartHome Garden soil moisture and water timer valve (Baldr Homgar, RainPoint)
+    [385]* Neptune R900 BCD flow meters
+    [386]  Olympia Protect 9571 alarm system sensors
 
 * Disabled by default, use -R n or a conf file to enable
 

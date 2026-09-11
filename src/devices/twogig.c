@@ -34,7 +34,7 @@ Demodulated as raw PCM (half-bit width ~136 us) with the preamble and
 Manchester decoding done explicitly in decode_fn, rather than relying on
 OOK_PULSE_MANCHESTER_ZEROBIT's own pulse-level auto-decode. That demod has
 no preamble-alignment step of its own -- any noise before the real signal
-starts (seen on some 5816/5820L/2GIG units at close range, where receiver
+starts (seen on some 5816/5820L/2GIG/Vivint units at close range, where receiver
 AGC overload makes the pre-message "gap" noisy) throws off its bit count
 from the very first edge, corrupting the whole message even though the
 underlying pulse train is intact. Searching for the preamble explicitly at
@@ -111,20 +111,22 @@ static int twogig_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     }
 
     //
-    if (len > 50) { // Newer 96 bit format
-        decoder_log_bitrow(decoder, 1, __func__, b, (len > 80 ? 80 : len), "Long format");
+    if (len > 50) { // Newer 96 bit format, might be used by eSeries devices
+        decoder_log_bitrow(decoder, 1, __func__, b, (len > 80 ? 80 : len), "");
     }
 
     int event = b[3];
-    // NOTE: not sure if these apply to all device types
 
     data_t *data = NULL;
 
+    // 2GIG devices have a TXID printed on them as 123-4567
+    // where the decimal value 1234567 is used as the ID transmitted with every packet
     char id_str[9];
-    snprintf(id_str, sizeof(id_str), "%03u-%04u", device_id/10000, device_id % 10000);
+    snprintf(id_str, sizeof(id_str), "%03u-%04u", device_id / 10000, device_id % 10000);
 
     if ((event & 0x0f) == 0x1) {
-        // Keypad
+        // Keypad - There might be other keypads that use the 0x01 constant.
+        // No other 345 device seems to use this least significant bit in the event data
         int key = (event >> 4) & 0x0f;
 
         // * == 10
@@ -139,7 +141,8 @@ static int twogig_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         data = data_make(
               "model",        "",             DATA_STRING, "2GIG-PAD1-345",
               "id",           "",             DATA_STRING, id_str,
-              "counter",      "",             DATA_INT,    channel,
+              "counter",      "",             DATA_INT,    channel, // For keypads, there is no channel
+              "channel",      "",             DATA_INT,    0xf,     // So let's use the same channel is as the keyfob
               "event",        "",             DATA_FORMAT, "%02x", DATA_INT, event,
               "key",          "",             DATA_INT, key,
               "arm_away",     "",             DATA_INT, arm_away,       
@@ -151,8 +154,8 @@ static int twogig_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         /* clang-format on */
     }
     else if ((event & 0xf) == 0xa) {
-        // Keyfob
-        int aux    = (event & 0x80) >> 7;
+        // Keyfob - There might be other 2GIG keyfobs that use the 0x0a constant
+        int aux      = (event & 0x80) >> 7;
         int arm_stay = (event & 0x40) >> 6;
         int disarm   = (event & 0x20) >> 5;
         int arm_away = (event & 0x10) >> 4;
